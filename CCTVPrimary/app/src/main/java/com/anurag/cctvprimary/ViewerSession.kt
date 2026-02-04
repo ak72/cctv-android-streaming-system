@@ -391,8 +391,9 @@ class ViewerSession(
             return
         }
 
-        // Hardened check: only accept frames when actually streaming (epoch assigned)
-        if (state != StreamState.STREAMING) {
+        // Accept frames in both STREAMING and RECONFIGURING. RECONFIGURING exits only when a keyframe is sent;
+        // if we dropped frames here during RECONFIGURING, no keyframe would ever reach the sender → deadlock.
+        if (state != StreamState.STREAMING && state != StreamState.RECONFIGURING) {
             Log.d(TAG, "[VIEWER SESSION] dropping frame — state=$state")
             return
         }
