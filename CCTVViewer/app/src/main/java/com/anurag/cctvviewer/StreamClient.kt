@@ -172,6 +172,16 @@ class StreamClient(
     @Volatile private var videoSeqGapCount: Long = 0L
     @Volatile private var lastSeqGapLogMs: Long = 0L
 
+    // --- Server authoritative state (CRITICAL #4 / STATE_MACHINE.md) ---
+    // When server sends STREAM_STATE we obey; inference (CSD/STREAM_ACCEPTED/frame render) is fallback only when server is silent.
+    @Volatile private var serverSupportsStreamState: Boolean = false
+    @Volatile private var lastStreamStateFromServerUptimeMs: Long = 0L
+    private const val STREAM_STATE_FALLBACK_SILENT_MS = 30_000L
+
+    /** True when we may infer RECOVERING/STREAMING from CSD/frame render (old server or server silent 30s). Prefer server STREAM_STATE when present. */
+    private fun useInferenceForState(): Boolean =
+        !serverSupportsStreamState || (android.os.SystemClock.uptimeMillis() - lastStreamStateFromServerUptimeMs) > STREAM_STATE_FALLBACK_SILENT_MS
+
     // --- Handshake / startup tracking ---
     // The Viewer can get stuck in AUTHENTICATED ("Starting stream…") if the negotiation messages
     // (STREAM_ACCEPTED/CSD/first keyframe) never arrive, or arrive out of order.
@@ -611,7 +621,7 @@ class StreamClient(
                 startHeartbeat()
                 startAudioPlayback()
 
-                send("HELLO|client=viewer|version=1")
+                send("HELLO|client=viewer|version=2")
                 // AUTH is now handled via CHAP (wait for AUTH_CHALLENGE)
 
 
@@ -903,6 +913,44 @@ class StreamClient(
                     line.startsWith("SESSION|") -> {
                         sessionId = line.substringAfter("id=").trim()
                         Log.d(logFrom, "[Stream Client] Session ID assigned: $sessionId")
+                    }
+
+                    line.startsWith("PROTO|") -> {
+                        val params = parseParams(line)
+                        val ver = params["version"]?.toIntOrNull() ?: 0
+                        if (ver >= 2) {
+                            serverSupportsStreamState = true
+                            Log.d(logFrom, "[Stream Client] PROTO version=$ver — server supports authoritative STREAM_STATE")
+                        }
+                    }
+
+                    line.startsWith("STREAM_STATE|") -> {
+                        // Format: STREAM_STATE|1|epoch=7 (numeric code: 1=ACTIVE, 2=RECONFIGURING, 3=PAUSED, 4=STOPPED)
+                        val params = parseParams(line)
+                        val code = line.substringAfter("STREAM_STATE|").substringBefore("|").toIntOrNull() ?: 0
+                        val msgEpoch = params["epoch"]?.toLongOrNull()
+                        val nowUptime = android.os.SystemClock.uptimeMillis()
+                        lastStreamStateFromServerUptimeMs = nowUptime
+                        if (msgEpoch != null && msgEpoch > 0L) streamEpoch = msgEpoch
+                        when (code) {
+                            1 -> {
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE ACTIVE (epoch=$msgEpoch) — posting STREAMING")
+                                postState(ConnectionState.STREAMING)
+                            }
+                            2 -> {
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE RECONFIGURING (epoch=$msgEpoch) — posting RECOVERING")
+                                postState(ConnectionState.RECOVERING)
+                            }
+                            3 -> {
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE PAUSED — posting CONNECTED")
+                                postState(ConnectionState.CONNECTED)
+                            }
+                            4 -> {
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — posting CONNECTED")
+                                postState(ConnectionState.CONNECTED)
+                            }
+                            else -> Log.w(logFrom, "[Stream Client] STREAM_STATE unknown code=$code")
+                        }
                     }
 
                     line.startsWith("RESUME_OK") -> {
@@ -1570,8 +1618,10 @@ class StreamClient(
                                     val started = startDecoderIfReady(forceWidth = newWidth, forceHeight = newHeight)
                                     Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] startDecoderIfReady() after resolution change reset: $started")
                                 }
-                                postState(ConnectionState.RECOVERING)
-                                Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] Posted RECOVERING state due to resolution change (decoder existed)")
+                                if (useInferenceForState()) {
+                                    postState(ConnectionState.RECOVERING)
+                                    Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] Posted RECOVERING state due to resolution change (decoder existed)")
+                                }
                             } else {
                                 // Resolution change but decoder doesn't exist yet - don't post RECOVERING
                                 // Decoder will be configured with new resolution when it starts
@@ -2554,9 +2604,10 @@ class StreamClient(
                             // We can legitimately enter RECOVERING during stalls/reconfigure windows even while the TCP
                             // connection stays alive. If we are visibly rendering again, we must promote back to STREAMING,
                             // otherwise the UI can show video while state remains RECOVERING.
+                            // Only infer STREAMING when server doesn't send STREAM_STATE (fallback for old Primaries).
                             try {
-                                if (currentState == ConnectionState.RECOVERING) {
-                                    Log.d(logFrom, "[Stream Client] ✅ [STATE] Frame rendered while RECOVERING -> posting STREAMING")
+                                if (currentState == ConnectionState.RECOVERING && useInferenceForState()) {
+                                    Log.d(logFrom, "[Stream Client] ✅ [STATE] Frame rendered while RECOVERING -> posting STREAMING (inference)")
                                     postState(ConnectionState.STREAMING)
                                 }
                             } catch (t: Throwable) {
@@ -2579,8 +2630,8 @@ class StreamClient(
                                             "🔵 [DECODER] Nord CE4: stable frames reached ($nordCe4RenderedFramesAfterWarmup) -> invoking onFirstFrameRendered"
                                         )
                                         try {
-                                            if (currentState != ConnectionState.STREAMING) {
-                                                Log.d(logFrom, "[Stream Client] ✅ [STATE] First stable rendered frames -> posting STREAMING (currentState=$currentState)")
+                                            if (currentState != ConnectionState.STREAMING && useInferenceForState()) {
+                                                Log.d(logFrom, "[Stream Client] ✅ [STATE] First stable rendered frames -> posting STREAMING (inference)")
                                                 postState(ConnectionState.STREAMING)
                                             }
                                         } catch (t: Throwable) {
@@ -2607,8 +2658,8 @@ class StreamClient(
                                                 "⚠️ [NORD_CE4] Fallback reveal: forcing first-frame rendered after ${renderAttemptAgeMs}ms of render attempts (stableFrames=$nordCe4RenderedFramesAfterWarmup)"
                                             )
                                             try {
-                                                if (currentState != ConnectionState.STREAMING) {
-                                                    Log.d(logFrom, "[Stream Client] ✅ [STATE] Fallback reveal -> posting STREAMING (currentState=$currentState)")
+                                                if (currentState != ConnectionState.STREAMING && useInferenceForState()) {
+                                                    Log.d(logFrom, "[Stream Client] ✅ [STATE] Fallback reveal -> posting STREAMING (inference)")
                                                     postState(ConnectionState.STREAMING)
                                                 }
                                             } catch (t: Throwable) {
@@ -2638,10 +2689,10 @@ class StreamClient(
                                         logFrom,
                                         "🔵 [DECODER] First frame rendered! Invoking onFirstFrameRendered callback"
                                     )
-                                    // Now that we have proven real rendering, we can safely declare STREAMING.
+                                    // Now that we have proven real rendering, we can safely declare STREAMING (only when server doesn't send STREAM_STATE).
                                     try {
-                                        if (currentState != ConnectionState.STREAMING) {
-                                            Log.d(logFrom, "[Stream Client] ✅ [STATE] First rendered frame -> posting STREAMING (currentState=$currentState)")
+                                        if (currentState != ConnectionState.STREAMING && useInferenceForState()) {
+                                            Log.d(logFrom, "[Stream Client] ✅ [STATE] First rendered frame -> posting STREAMING (inference)")
                                             postState(ConnectionState.STREAMING)
                                         }
                                     } catch (t: Throwable) {
@@ -3681,6 +3732,8 @@ class StreamClient(
 
         out = null
         socket = null
+        serverSupportsStreamState = false
+        lastStreamStateFromServerUptimeMs = 0L
         try { setPreviewVisible(false) } catch (_: Throwable) {}
     }
 

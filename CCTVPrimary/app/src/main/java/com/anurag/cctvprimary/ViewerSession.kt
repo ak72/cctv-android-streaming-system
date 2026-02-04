@@ -35,6 +35,12 @@ class ViewerSession(
         private const val FRAME_QUEUE_CAPACITY = 30
         private const val CONTROL_QUEUE_CAPACITY = 60
         private const val HEARTBEAT_CHECK_INTERVAL_MS = 2_000L
+
+        /** Protocol stream state codes (authoritative; viewer must obey). 1=ACTIVE, 2=RECONFIGURING, 3=PAUSED, 4=STOPPED */
+        private const val STREAM_STATE_ACTIVE = 1
+        private const val STREAM_STATE_RECONFIGURING = 2
+        private const val STREAM_STATE_PAUSED = 3
+        private const val STREAM_STATE_STOPPED = 4
     }
 
 
@@ -95,11 +101,19 @@ class ViewerSession(
     private val stateWrapper = AtomicBoolean(false) // For idempotent close
 
     /**
+     * Whether we have sent STREAM_STATE|ACTIVE for the current epoch.
+     * ACTIVE is sent only after the first keyframe is transmitted (per STATE_MACHINE.md).
+     */
+    @Volatile
+    private var activeSentForThisEpoch = false
+
+    /**
      * Set the current stream epoch for this session.
      *
      * Intended to be called by StreamServer immediately before (or together with) sending STREAM_ACCEPTED.
      */
     fun setStreamEpoch(epoch: Long) {
+        val prevEpoch = streamEpoch
         streamEpoch = epoch
         // Reset seq ONLY when the epoch actually changes.
         // Avoid spurious seq resets when StreamServer re-sends STREAM_ACCEPTED for the same epoch.
@@ -107,6 +121,8 @@ class ViewerSession(
             lastSeqEpoch = epoch
             frameSeq.set(0L)
         }
+        // New epoch: we must send ACTIVE again after first keyframe of this epoch.
+        if (epoch != prevEpoch) activeSentForThisEpoch = false
     }
 
     // --- Heartbeat ---
@@ -279,6 +295,7 @@ class ViewerSession(
 
                     pendingConfig = cfg
                     state = StreamState.RECONFIGURING
+                    sendStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
                     // IMPORTANT:
                     // Do NOT send STREAM_ACCEPTED here.
                     // StreamServer is the single source of truth for accepted config because it can:
@@ -336,6 +353,7 @@ class ViewerSession(
 
                 line == "BACKPRESSURE" -> {
                     state = StreamState.RECONFIGURING
+                    sendStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
                     onCommand(this, RemoteCommand.BACKPRESSURE, null)
                 }
 
@@ -458,6 +476,12 @@ class ViewerSession(
                     
                     if (state == StreamState.RECONFIGURING && !frame.isKeyFrame) continue
 
+                    // Send ACTIVE only after first keyframe is transmitted (STATE_MACHINE.md).
+                    if (frame.isKeyFrame && !activeSentForThisEpoch) {
+                        sendStreamState(STREAM_STATE_ACTIVE, streamEpoch)
+                        activeSentForThisEpoch = true
+                    }
+
                     try {
                         synchronized(writeLock) {
                             if (socket.isClosed) throw java.net.SocketException("Closed")
@@ -566,6 +590,9 @@ class ViewerSession(
             Log.d(TAG, "[VIEWER SESSION] Authentication successful — activating session")
             state = StreamState.AUTHENTICATED
             sendControl("SESSION|id=$sessionId")
+            // Full state snapshot after AUTH so late joiners / reconnects never guess (STATE_MACHINE.md).
+            sendControl("PROTO|version=2")
+            sendStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
             // Sender NOT started here - waiting for enableStreaming()
             onAuthenticated(this)
         } else {
@@ -576,6 +603,7 @@ class ViewerSession(
     /**
      * Enable streaming for this session.
      * Must be called ONLY after the server has sent STREAM_ACCEPTED.
+     * We stay in RECONFIGURING until the first keyframe is sent; then we send STREAM_STATE|ACTIVE (STATE_MACHINE.md).
      */
     fun enableStreaming(epoch: Long) {
         if (state == StreamState.STREAMING) {
@@ -584,8 +612,9 @@ class ViewerSession(
         }
         Log.i("VIEWER SESSION", "enableStreaming(epoch=$epoch)")
         setStreamEpoch(epoch)
-        state = StreamState.STREAMING
-        Log.i("VIEWER SESSION", "state -> STREAMING")
+        activeSentForThisEpoch = false
+        state = StreamState.RECONFIGURING
+        Log.i("VIEWER SESSION", "state -> RECONFIGURING (ACTIVE sent after first keyframe)")
     }
 
     private fun startHeartbeatWatchdog() {
@@ -620,6 +649,14 @@ class ViewerSession(
     fun sendControl(msg: String) {
         // Never write to the socket on the caller thread (caller can be the UI thread).
         controlQueue.offer(ControlItem.Line(msg))
+    }
+
+    /**
+     * Send authoritative stream state to the viewer (numeric code + epoch).
+     * Server is the source of truth; viewer must obey and not infer state from side effects.
+     */
+    private fun sendStreamState(code: Int, epoch: Long) {
+        sendControl("STREAM_STATE|$code|epoch=$epoch")
     }
 
     fun sendCsd(sps: ByteArray, pps: ByteArray) {
