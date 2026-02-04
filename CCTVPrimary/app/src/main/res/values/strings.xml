@@ -1,0 +1,59 @@
+<resources>
+    <string name="app_name">CCTVPrimary</string>
+    
+    <!-- Main Screen -->
+    <string name="title_cctv_camera">CCTV Camera</string>
+    <string name="device_ip">Device IP: %1$s</string>
+    <string name="content_description_settings">Settings</string>
+    
+    <!-- Settings Dialog -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_port">Port</string>
+    <string name="settings_port_valid_range">Valid range: 1–65535.</string>
+    <string name="settings_port_cannot_change">Port number cannot be changed after capturing has started.</string>
+    <string name="settings_storage_folder">Storage folder</string>
+    <string name="settings_storage_selected_via_browse">Selected via Browse.</string>
+    <string name="settings_storage_browse_recommended">Browse is recommended.</string>
+    <string name="content_description_browse_folder">Browse folder</string>
+    <string name="content_description_clear_folder">Clear folder</string>
+    <string name="settings_available_storage">Available storage</string>
+    <string name="settings_storage_internal">Internal: %1$s</string>
+    <string name="settings_storage_external">SD Card / External: %1$s</string>
+    <string name="settings_file_rotation">File rotation</string>
+    <string name="settings_force_buffer_mode">Force buffer mode</string>
+    <string name="settings_force_buffer_mode_desc">Use ImageAnalysis instead of Surface input (fallback for problematic devices)</string>
+    <string name="settings_storage_limit_mb">Storage limit (MB)</string>
+    <string name="settings_storage_limit_rotation_on">When rotation is ON, old recordings are deleted beyond this limit.</string>
+    <string name="settings_storage_limit_rotation_off">Disabled because File rotation is OFF.</string>
+    <string name="button_save">Save</string>
+    <string name="button_cancel">Cancel</string>
+    
+    <!-- Camera Controls -->
+    <string name="content_description_switch_to_back_camera">Switch to back camera</string>
+    <string name="content_description_switch_to_front_camera">Switch to front camera</string>
+    <string name="label_record_audio">Record Audio</string>
+    <string name="label_talkback">Talkback</string>
+    <string name="label_access_password">Access Password</string>
+    <string name="label_torch">Torch</string>
+    <string name="label_exposure_compensation">Exposure compensation</string>
+    
+    <!-- Toast Messages -->
+    <string name="toast_audio_communication_disabled">Audio communication with the other device will be disabled.</string>
+    <string name="toast_record_audio_disabled_talkback">Record Audio is disabled while Talk Back is ON.</string>
+    <string name="toast_port_cannot_change">Port number cannot be changed after capturing has started.</string>
+    
+    <!-- Buttons -->
+    <string name="button_start_capture">Start Capture</string>
+    <string name="button_stop_capture">Stop Capture</string>
+    <string name="button_start_recording">Start Recording</string>
+    <string name="button_stop_recording">Stop Recording</string>
+    
+    <!-- Recording Status -->
+    <string name="recording_with_audio">Recording with audio</string>
+    <string name="recording_without_audio">Recording without audio</string>
+    
+    <!-- Notification -->
+    <string name="notification_title">CCTV Running</string>
+    <string name="notification_content">Camera active</string>
+    <string name="notification_action_stop_capture">Stop Capture</string>
+</resources>

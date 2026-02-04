@@ -1,0 +1,32 @@
+# Android
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+
+# Kotlin
+*.class
+out/
+
+# Generated
+bin/
+gen/
+
+# Signing
+*.jks
+*.keystore
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+
+#User
+/CCTVPrimary/.cursor
+/CCTVPrimary/Docs
