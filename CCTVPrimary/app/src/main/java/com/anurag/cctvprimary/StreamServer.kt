@@ -57,6 +57,9 @@ class StreamServer(
      * Contract:
      * - STREAM_ACCEPTED, CSD, and FRAME messages include epoch=<n>.
      * - Viewer must drop any CSD/FRAME that does not match the latest accepted epoch.
+     * - We include epoch inside STREAM_ACCEPTED (even though we send it in STREAM_STATE too) so that
+     *   under load, if control messages reorder, the accept is unambiguously tied to an epoch—
+     *   bundling reduces ambiguity (production trick).
      *
      * Note:
      * - We start at 0 (unknown / not yet negotiated). The first negotiated config bumps to 1.
@@ -616,6 +619,21 @@ class StreamServer(
             session.sendControl("CAMERA|front=$front")
         }
     }
+
+    /**
+     * Broadcast STREAM_STATE|STOPPED to all sessions so viewers can distinguish "stream intentionally ended" from "network lost".
+     * Call when capture/encoder is stopped (e.g. stopCapture).
+     */
+    fun broadcastStreamStateStopped() {
+        sessions.forEach { session ->
+            try {
+                session.sendStreamStateStopped()
+            } catch (t: Throwable) {
+                Log.w(logFrom, "[STREAM SERVER] broadcastStreamStateStopped failed for session (ignored)", t)
+            }
+        }
+    }
+
     private fun startSender() {
         if (senderRunning) {
             Log.d(logFrom, "🔵 [STREAM SERVER] Sender thread already running")

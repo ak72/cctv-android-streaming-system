@@ -137,6 +137,8 @@ class ViewerSession(
         class Csd(val sps: ByteArray, val pps: ByteArray) : ControlItem()
     }
     private val controlQueue = LinkedBlockingQueue<ControlItem>(CONTROL_QUEUE_CAPACITY)
+    /** STREAM_STATE (code, epoch) queue. Only the sender thread drains this and writes to the wire so ordering cannot regress. */
+    private val streamStateQueue = LinkedBlockingQueue<Pair<Int, Long>>(32)
     private data class AudioItem(val pcm: ByteArray, val tsUs: Long, val rate: Int, val ch: Int, val isCompressed: Boolean) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -295,7 +297,7 @@ class ViewerSession(
 
                     pendingConfig = cfg
                     state = StreamState.RECONFIGURING
-                    sendStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
+                    scheduleStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
                     // IMPORTANT:
                     // Do NOT send STREAM_ACCEPTED here.
                     // StreamServer is the single source of truth for accepted config because it can:
@@ -353,7 +355,7 @@ class ViewerSession(
 
                 line == "BACKPRESSURE" -> {
                     state = StreamState.RECONFIGURING
-                    sendStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
+                    scheduleStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
                     onCommand(this, RemoteCommand.BACKPRESSURE, null)
                 }
 
@@ -432,6 +434,21 @@ class ViewerSession(
                 while (senderRunning) {
                     // Check if socket is still connected
                     if (socket.isClosed || state == StreamState.DISCONNECTED) break
+
+                    // 0. Drain STREAM_STATE queue first (single authority: only this thread writes state to wire)
+                    while (true) {
+                        val stateMsg = streamStateQueue.poll() ?: break
+                        try {
+                            synchronized(writeLock) {
+                                if (socket.isClosed) throw java.net.SocketException("Closed")
+                                writeLine("STREAM_STATE|${stateMsg.first}|epoch=${stateMsg.second}")
+                                out.flush()
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "[VIEWER SESSION] STREAM_STATE send error: ${e.message}")
+                            throw e
+                        }
+                    }
                     
                     // 1. Process Control Messages (High Priority)
                     while (true) {
@@ -476,9 +493,9 @@ class ViewerSession(
                     
                     if (state == StreamState.RECONFIGURING && !frame.isKeyFrame) continue
 
-                    // Send ACTIVE only after first keyframe is transmitted (STATE_MACHINE.md).
+                    // Send ACTIVE only after first keyframe is transmitted (STATE_MACHINE.md). We're on sender thread so offer directly.
                     if (frame.isKeyFrame && !activeSentForThisEpoch) {
-                        sendStreamState(STREAM_STATE_ACTIVE, streamEpoch)
+                        streamStateQueue.offer(Pair(STREAM_STATE_ACTIVE, streamEpoch))
                         activeSentForThisEpoch = true
                     }
 
@@ -556,6 +573,7 @@ class ViewerSession(
         senderRunning = false
         frameQueue.clear()
         controlQueue.clear()
+        streamStateQueue.clear()
 
         try {
             socket.close()
@@ -592,7 +610,7 @@ class ViewerSession(
             sendControl("SESSION|id=$sessionId")
             // Full state snapshot after AUTH so late joiners / reconnects never guess (STATE_MACHINE.md).
             sendControl("PROTO|version=2")
-            sendStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
+            scheduleStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
             // Sender NOT started here - waiting for enableStreaming()
             onAuthenticated(this)
         } else {
@@ -652,11 +670,20 @@ class ViewerSession(
     }
 
     /**
-     * Send authoritative stream state to the viewer (numeric code + epoch).
-     * Server is the source of truth; viewer must obey and not infer state from side effects.
+     * Schedule STREAM_STATE to be sent from the sender thread only. Ensures a single authority path so ordering cannot regress
+     * (e.g. ACTIVE then late RECONFIGURING). Call from listener or from outside (e.g. broadcast); sender thread drains and writes.
      */
-    private fun sendStreamState(code: Int, epoch: Long) {
-        sendControl("STREAM_STATE|$code|epoch=$epoch")
+    private fun scheduleStreamState(code: Int, epoch: Long) {
+        senderExecutor.execute { streamStateQueue.offer(Pair(code, epoch)) }
+    }
+
+    /**
+     * Send STREAM_STATE|STOPPED so the viewer can distinguish "stream intentionally ended" from "network lost".
+     * Mandatory terminal state. Funneled through sender thread like all state.
+     */
+    fun sendStreamStateStopped() {
+        val epoch = streamEpoch
+        senderExecutor.execute { streamStateQueue.offer(Pair(STREAM_STATE_STOPPED, epoch)) }
     }
 
     fun sendCsd(sps: ByteArray, pps: ByteArray) {

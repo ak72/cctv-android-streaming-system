@@ -176,11 +176,8 @@ class StreamClient(
     // When server sends STREAM_STATE we obey; inference (CSD/STREAM_ACCEPTED/frame render) is fallback only when server is silent.
     @Volatile private var serverSupportsStreamState: Boolean = false
     @Volatile private var lastStreamStateFromServerUptimeMs: Long = 0L
-    private const val STREAM_STATE_FALLBACK_SILENT_MS = 30_000L
-
-    /** True when we may infer RECOVERING/STREAMING from CSD/frame render (old server or server silent 30s). Prefer server STREAM_STATE when present. */
-    private fun useInferenceForState(): Boolean =
-        !serverSupportsStreamState || (android.os.SystemClock.uptimeMillis() - lastStreamStateFromServerUptimeMs) > STREAM_STATE_FALLBACK_SILENT_MS
+    /** Single guard: may we infer RECOVERING/STREAMING/CONNECTED from inference or watchdog? Binary authority only (no timeout). When server sends STREAM_STATE we never infer. */
+    private fun canInferState(): Boolean = !serverSupportsStreamState
 
     // --- Handshake / startup tracking ---
     // The Viewer can get stuck in AUTHENTICATED ("Starting stream…") if the negotiation messages
@@ -946,8 +943,9 @@ class StreamClient(
                                 postState(ConnectionState.CONNECTED)
                             }
                             4 -> {
-                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — posting CONNECTED")
-                                postState(ConnectionState.CONNECTED)
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — stream intentionally ended; disconnecting")
+                                postState(ConnectionState.DISCONNECTED)
+                                disconnectForRecovery("server_stopped")
                             }
                             else -> Log.w(logFrom, "[Stream Client] STREAM_STATE unknown code=$code")
                         }
@@ -1618,7 +1616,7 @@ class StreamClient(
                                     val started = startDecoderIfReady(forceWidth = newWidth, forceHeight = newHeight)
                                     Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] startDecoderIfReady() after resolution change reset: $started")
                                 }
-                                if (useInferenceForState()) {
+                                if (canInferState()) {
                                     postState(ConnectionState.RECOVERING)
                                     Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] Posted RECOVERING state due to resolution change (decoder existed)")
                                 }
@@ -2606,7 +2604,7 @@ class StreamClient(
                             // otherwise the UI can show video while state remains RECOVERING.
                             // Only infer STREAMING when server doesn't send STREAM_STATE (fallback for old Primaries).
                             try {
-                                if (currentState == ConnectionState.RECOVERING && useInferenceForState()) {
+                                if (currentState == ConnectionState.RECOVERING && canInferState()) {
                                     Log.d(logFrom, "[Stream Client] ✅ [STATE] Frame rendered while RECOVERING -> posting STREAMING (inference)")
                                     postState(ConnectionState.STREAMING)
                                 }
@@ -2630,7 +2628,7 @@ class StreamClient(
                                             "🔵 [DECODER] Nord CE4: stable frames reached ($nordCe4RenderedFramesAfterWarmup) -> invoking onFirstFrameRendered"
                                         )
                                         try {
-                                            if (currentState != ConnectionState.STREAMING && useInferenceForState()) {
+                                            if (currentState != ConnectionState.STREAMING && canInferState()) {
                                                 Log.d(logFrom, "[Stream Client] ✅ [STATE] First stable rendered frames -> posting STREAMING (inference)")
                                                 postState(ConnectionState.STREAMING)
                                             }
@@ -2658,7 +2656,7 @@ class StreamClient(
                                                 "⚠️ [NORD_CE4] Fallback reveal: forcing first-frame rendered after ${renderAttemptAgeMs}ms of render attempts (stableFrames=$nordCe4RenderedFramesAfterWarmup)"
                                             )
                                             try {
-                                                if (currentState != ConnectionState.STREAMING && useInferenceForState()) {
+                                                if (currentState != ConnectionState.STREAMING && canInferState()) {
                                                     Log.d(logFrom, "[Stream Client] ✅ [STATE] Fallback reveal -> posting STREAMING (inference)")
                                                     postState(ConnectionState.STREAMING)
                                                 }
@@ -2691,7 +2689,7 @@ class StreamClient(
                                     )
                                     // Now that we have proven real rendering, we can safely declare STREAMING (only when server doesn't send STREAM_STATE).
                                     try {
-                                        if (currentState != ConnectionState.STREAMING && useInferenceForState()) {
+                                        if (currentState != ConnectionState.STREAMING && canInferState()) {
                                             Log.d(logFrom, "[Stream Client] ✅ [STATE] First rendered frame -> posting STREAMING (inference)")
                                             postState(ConnectionState.STREAMING)
                                         }
@@ -3832,8 +3830,9 @@ class StreamClient(
                 }
 
                 // If we're AUTHENTICATED for too long with no frames (or frames stalled), downgrade to CONNECTED to show "No Video".
+                // When server sends STREAM_STATE we never override (server is source of truth).
                 val shouldDowngrade = (noFramesEver && sinceAuthOk >= 12_000L) || framesStalled
-                if (shouldDowngrade) {
+                if (shouldDowngrade && canInferState()) {
                     Log.w(
                         logFrom,
                         "[Stream Client] ⚠️ [HANDSHAKE] No frames after ${sinceAuthOk}ms in AUTHENTICATED (noFramesEver=$noFramesEver framesStalled=$framesStalled sinceLastActivityMs=${if (lastActivity > 0L) sinceLastActivity else -1L}) -> posting CONNECTED (No Video)"
@@ -3923,8 +3922,8 @@ class StreamClient(
                             Log.w(logFrom, "[Stream Client] CONNECTED renegotiate: SET_STREAM failed (non-fatal)", t)
                         }
                         requestKeyframe("connected_renegotiate")
-                        // Use RECOVERING to make UI intent explicit while we wait for fresh frames/render.
-                        postState(ConnectionState.RECOVERING)
+                        // Use RECOVERING to make UI intent explicit while we wait for fresh frames/render. Never override when server is authoritative.
+                        if (canInferState()) postState(ConnectionState.RECOVERING)
                     }
                 }
 
@@ -3945,13 +3944,13 @@ class StreamClient(
                         Log.w(logFrom, "[Stream Client] 🟡 [AUDIO ACTIVE] Skipping disconnect while CONNECTED; waiting for video to resume")
                         beginReconfigureGrace("connected_audio_active_no_video", 120_000L)
                         requestKeyframe("connected_audio_active_probe")
-                        postState(ConnectionState.RECOVERING)
+                        if (canInferState()) postState(ConnectionState.RECOVERING)
                     } else if (!inGrace) {
                         disconnectForRecovery("connected_stuck_too_long")
                     } else {
                         Log.w(logFrom, "[Stream Client] 🟡 [RECONFIG GRACE] Skipping disconnect while CONNECTED (recording/reconfigure grace window)")
                         requestKeyframe("connected_grace_probe")
-                        postState(ConnectionState.RECOVERING)
+                        if (canInferState()) postState(ConnectionState.RECOVERING)
                     }
                 }
             }
@@ -4012,11 +4011,11 @@ class StreamClient(
 
             // If we're inside an expected reconfigure window OR we have active audio, do not downgrade to CONNECTED
             // and do not trigger CONNECTED-state "stuckTooLong" disconnect escalation. Stay in RECOVERING and wait.
+            // When server sends STREAM_STATE we never change state from watchdog (server is source of truth).
             if (inGrace || audioActive) {
-                // Socket is alive; tolerate brief stall during recording/encoder/camera reconfigure.
                 waitingForKeyframe = true
                 requestKeyframe(if (inGrace) "watchdog_reconfigure_grace" else "watchdog_audio_active_no_video")
-                postState(ConnectionState.RECOVERING)
+                if (canInferState()) postState(ConnectionState.RECOVERING)
                 return
             }
 
@@ -4035,11 +4034,12 @@ class StreamClient(
             // IMPORTANT: Do NOT reset the decoder here. Resetting during normal "capture stopped" creates flicker,
             // state flapping, and can trigger green-frame artifacts on some devices.
             // We simply downgrade to CONNECTED and wait for a clean keyframe + render to re-enter STREAMING.
+            // When server sends STREAM_STATE we never override (server is source of truth).
             postedFirstFrameRendered = false
             renderWindowStartMs = 0L
             renderFramesInWindow = 0
             requestKeyframe("watchdog_no_frames")
-            postState(ConnectionState.CONNECTED)
+            if (canInferState()) postState(ConnectionState.CONNECTED)
         } catch (t: Throwable) {
             Log.w(logFrom, "[Stream Client] [WATCHDOG]  Stream watchdog failed (non-fatal)", t)
         }

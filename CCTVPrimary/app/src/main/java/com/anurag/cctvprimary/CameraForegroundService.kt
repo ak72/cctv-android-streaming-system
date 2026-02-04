@@ -2821,6 +2821,11 @@ class CameraForegroundService : LifecycleService() {
         }
         currentCamera = null
 
+        // Tell viewers "stream intentionally ended" so they can map to DISCONNECTED and distinguish from network loss.
+        try {
+            streamServer?.broadcastStreamStateStopped()
+        } catch (_: Throwable) {
+        }
         try {
             stopEncoder()
         } catch (_: Throwable) {
