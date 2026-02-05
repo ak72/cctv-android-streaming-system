@@ -96,6 +96,8 @@ internal object DeviceProfileStore {
         obj.put("encoderBitrateMin", profile.encoderBitrateRangeBps?.first)
         obj.put("encoderBitrateMax", profile.encoderBitrateRangeBps?.last)
         obj.put("preferBufferMode", profile.preferBufferMode)
+        obj.put("allowFpsGovernor", profile.allowFpsGovernor)
+        obj.put("allowDynamicBitrate", profile.allowDynamicBitrate)
         obj.put("maxRecommendedBitrateBps", profile.maxRecommendedBitrateBps)
         obj.put("qualityLadder", encodeConfigs(profile.qualityLadder))
         obj.put("activeProbeSelectedConfig", profile.activeProbeSelectedConfig?.let { cfg ->
@@ -147,6 +149,8 @@ internal object DeviceProfileStore {
             hasAvcSurfaceInput = o.optBoolean("hasAvcSurfaceInput", true),
             encoderBitrateRangeBps = brRange,
             preferBufferMode = o.optBoolean("preferBufferMode", false),
+            allowFpsGovernor = o.optBoolean("allowFpsGovernor", true),
+            allowDynamicBitrate = o.optBoolean("allowDynamicBitrate", true),
             maxRecommendedBitrateBps = o.getInt("maxRecommendedBitrateBps"),
             qualityLadder = decodeConfigs(o.getJSONArray("qualityLadder")),
             activeProbeSelectedConfig = o.optJSONObject("activeProbeSelectedConfig")?.let { cfg ->

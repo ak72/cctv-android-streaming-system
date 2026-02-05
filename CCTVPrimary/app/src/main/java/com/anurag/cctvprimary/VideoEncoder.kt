@@ -21,6 +21,15 @@ interface EncodedFrameListener {
 }
 
 /**
+ * Sink for tee'ing encoder output to recording (MediaMuxer). Single encoder feeds both streaming and recording.
+ * Called from encoder drain thread; implementations must be thread-safe for muxer writes.
+ */
+interface RecordingSink {
+    fun onCsd(sps: ByteArray, pps: ByteArray)
+    fun onEncodedFrame(frame: EncodedFrame)
+}
+
+/**
  * VideoEncoder - Supports Both Surface Input (Zero-Copy) and ByteBuffer Input (Fallback)
  *
  * Surface Input Mode:
@@ -81,6 +90,9 @@ class VideoEncoder(
     private var mediaCodec: MediaCodec? = null
     private var frameListener: EncodedFrameListener? = null
     private var codecConfigListener: ((sps: ByteArray, pps: ByteArray) -> Unit)? = null
+    @Volatile private var recordingSink: RecordingSink? = null
+    private var lastCsdSps: ByteArray? = null
+    private var lastCsdPps: ByteArray? = null
     private val frameQueue = ArrayBlockingQueue<EncodedFrame>(30)
 
     // YUV conversion for ByteBuffer mode
@@ -122,6 +134,18 @@ class VideoEncoder(
     // Track when encoder first got stuck (for accurate stuck duration tracking)
     @Volatile
     private var encoderStuckSinceMs: Long = -1L
+    @Volatile
+    private var recoveryRequestedForStuck: Boolean = false
+
+    // Keyframe watchdog: if no keyframe for 2× GOP → request sync; if still none for 3× GOP → recovery
+    @Volatile
+    private var lastKeyframeOutputTimeMs: Long = -1L
+    @Volatile
+    private var keyframeDroughtSyncRequestedAtMs: Long = 0L
+
+    /** Set in drain loop; invoked when recovery needed (stuck >5s or keyframe drought). */
+    @Volatile
+    private var onRecoveryNeeded: (() -> Unit)? = null
 
     // Map encoder PTS -> capture epoch time (ms) for real cross-device latency measurements.
     private val ptsToCaptureMs = HashMap<Long, Long>(256)
@@ -132,6 +156,34 @@ class VideoEncoder(
 
     fun setCodecConfigListener(listener: (sps: ByteArray, pps: ByteArray) -> Unit) {
         codecConfigListener = listener
+    }
+
+    /**
+     * Set callback for encoder recovery. When the encoder is stuck >5s or has had no keyframe for 3× GOP
+     * (after requesting sync at 2× GOP), this is invoked. Owner should post to main thread and call stop/start
+     * encoder so the pipeline cannot stall permanently.
+     */
+    fun setOnRecoveryNeeded(callback: (() -> Unit)?) {
+        onRecoveryNeeded = callback
+    }
+
+    /**
+     * Set sink for recording (tee). Encoder output is sent to both frameListener (streaming) and recordingSink (muxer).
+     * If CSD was already sent, onCsd is invoked immediately so muxer can add video track.
+     */
+    fun setRecordingSink(sink: RecordingSink?) {
+        recordingSink = sink
+        if (sink != null) {
+            val sps = lastCsdSps
+            val pps = lastCsdPps
+            if (sps != null && pps != null) {
+                try {
+                    sink.onCsd(sps, pps)
+                } catch (e: Exception) {
+                    Log.e(TAG, "RecordingSink.onCsd failed", e)
+                }
+            }
+        }
     }
 
     companion object {
@@ -146,7 +198,6 @@ class VideoEncoder(
          */
         fun shouldPreferBufferMode(context: Context, forceBufferMode: Boolean): Boolean {
             if (forceBufferMode) return true
-            if (DeviceQuirks.forceBufferInputMode()) return true
             if (!EncoderCapabilityDetector.hasAvcSurfaceInputEncoder()) return true
             if (EncoderProbeStore.wasSurfaceInputMarkedBad(context)) return true
             return false
@@ -162,7 +213,7 @@ class VideoEncoder(
         if (shouldPreferBufferMode(context, forceBufferMode)) {
             Log.d(
                 TAG,
-                "Using Buffer mode: preferBuffer=true (force=$forceBufferMode, quirk=${DeviceQuirks.forceBufferInputMode()}, hasSurface=${EncoderCapabilityDetector.hasAvcSurfaceInputEncoder()}, cachedBad=${EncoderProbeStore.wasSurfaceInputMarkedBad(context)})"
+                "Using Buffer mode: preferBuffer=true (force=$forceBufferMode, hasSurface=${EncoderCapabilityDetector.hasAvcSurfaceInputEncoder()}, cachedBad=${EncoderProbeStore.wasSurfaceInputMarkedBad(context)})"
             )
             return true
         }
@@ -629,15 +680,20 @@ class VideoEncoder(
                             Log.e(TAG, "Failed to request sync frame to unstick encoder", e)
                         }
 
-                        // CRITICAL: If encoder has been stuck for more than 5 seconds, log a severe warning
-                        // This suggests the encoder is in a deep stuck state and may need restart
+                        // CRITICAL: If encoder has been stuck for more than 5 seconds, request recovery (restart)
                         if (stuckDuration > 5000) {
-                            Log.e(
-                                TAG,
-                                "🔴 [ENCODER STALL] CRITICAL: Encoder stuck for ${stuckDuration}ms (>5s). Encoder may need restart. inputFrames=$inputCount, outputFrames=$outputCount, frameQueueSize=${frameQueue.size}"
-                            )
-                            // TODO: Consider implementing encoder restart/recovery logic here
-                            // For now, just log the critical state
+                            if (!recoveryRequestedForStuck) {
+                                recoveryRequestedForStuck = true
+                                Log.e(
+                                    TAG,
+                                    "🔴 [ENCODER STALL] CRITICAL: Encoder stuck ${stuckDuration}ms (>5s). Requesting encoder recovery (restart)."
+                                )
+                                try {
+                                    onRecoveryNeeded?.invoke()
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Recovery callback failed", e)
+                                }
+                            }
                         }
                     } else {
                         // Encoder is not stuck - reset stuck tracking
@@ -647,6 +703,34 @@ class VideoEncoder(
                                 "🔵 [ENCODER STALL] Encoder recovered - resetting stuck tracking"
                             )
                             encoderStuckSinceMs = -1L
+                            recoveryRequestedForStuck = false
+                        }
+                    }
+                }
+
+                // Keyframe watchdog: if no keyframe for 2× GOP → request sync; if still none for 3× GOP → recovery
+                if (loopIteration % 60 == 0 && iFrameInterval > 0) {
+                    val nowMs = System.currentTimeMillis()
+                    val refMs = if (lastKeyframeOutputTimeMs >= 0) lastKeyframeOutputTimeMs else encoderStartTimeMs
+                    val droughtMs = nowMs - refMs
+                    val gopMs = iFrameInterval * 1000L
+                    if (droughtMs > 2 * gopMs) {
+                        if (keyframeDroughtSyncRequestedAtMs == 0L) {
+                            Log.w(TAG, "🔴 [KEYFRAME WATCHDOG] No keyframe for ${droughtMs}ms (2× GOP=${2 * gopMs}ms). Requesting sync frame.")
+                            try {
+                                requestSyncFrame()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Keyframe watchdog: requestSyncFrame failed", e)
+                            }
+                            keyframeDroughtSyncRequestedAtMs = nowMs
+                        } else if (droughtMs > 3 * gopMs) {
+                            Log.e(TAG, "🔴 [KEYFRAME WATCHDOG] Still no keyframe after 3× GOP (${droughtMs}ms). Requesting encoder recovery.")
+                            keyframeDroughtSyncRequestedAtMs = 0L
+                            try {
+                                onRecoveryNeeded?.invoke()
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Recovery callback failed", e)
+                            }
                         }
                     }
                 }
@@ -720,8 +804,14 @@ class VideoEncoder(
                                 TAG,
                                 "Encoder config (csd) ready: sps=${sps.size}, pps=${pps.size}"
                             )
-                            // CSD is critical - invoke listener immediately
+                            lastCsdSps = sps.copyOf()
+                            lastCsdPps = pps.copyOf()
                             codecConfigListener?.invoke(sps, pps)
+                            try {
+                                recordingSink?.onCsd(sps, pps)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "RecordingSink.onCsd failed", e)
+                            }
                             Log.d(TAG, "CSD listener invoked (should trigger broadcastCsd)")
                         } else {
                             Log.w(
@@ -778,6 +868,8 @@ class VideoEncoder(
                                         "🔍 [CSD DIAGNOSTIC] codecConfigListener is ${if (codecConfigListener != null) "SET" else "NULL"}"
                                     )
 
+                                    lastCsdSps = sps.copyOf()
+                                    lastCsdPps = pps.copyOf()
                                     if (codecConfigListener != null) {
                                         Log.d(
                                             TAG,
@@ -793,6 +885,11 @@ class VideoEncoder(
                                             TAG,
                                             "🔴 [CSD DIAGNOSTIC] CRITICAL: codecConfigListener is NULL - CSD will NOT be broadcast!"
                                         )
+                                    }
+                                    try {
+                                        recordingSink?.onCsd(sps, pps)
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "RecordingSink.onCsd failed", e)
                                     }
                                     csdSent = true
                                     Log.d(
@@ -842,15 +939,30 @@ class VideoEncoder(
                                                 TAG,
                                                 "🔵 [CSD RECOVERY] Extracted SPS/PPS from buffer: sps=${sps.size}, pps=${pps.size}"
                                             )
+                                            lastCsdSps = sps.copyOf()
+                                            lastCsdPps = pps.copyOf()
                                             codecConfigListener?.invoke(sps, pps)
+                                            try {
+                                                recordingSink?.onCsd(sps, pps)
+                                            } catch (e: Exception) {
+                                                Log.e(TAG, "RecordingSink.onCsd failed", e)
+                                            }
                                             csdSent = true
                                         } else {
                                             Log.w(
                                                 TAG,
                                                 "Could not split CSD buffer (no second start code found). Sending whole serving as SPS."
                                             )
-                                            // Fallback: Send everything as SPS, empty PPS (Viewer might verify invalid PPS but worth a shot)
-                                            codecConfigListener?.invoke(data, ByteArray(0))
+                                            val fallbackSps = data.copyOf()
+                                            val fallbackPps = ByteArray(0)
+                                            lastCsdSps = fallbackSps
+                                            lastCsdPps = fallbackPps
+                                            codecConfigListener?.invoke(fallbackSps, fallbackPps)
+                                            try {
+                                                recordingSink?.onCsd(fallbackSps, fallbackPps)
+                                            } catch (e: Exception) {
+                                                Log.e(TAG, "RecordingSink.onCsd failed", e)
+                                            }
                                             csdSent = true
                                         }
                                     }
@@ -983,7 +1095,14 @@ class VideoEncoder(
                                                 TAG,
                                                 "🔵 [CSD RECOVERY] SUCCESS: Extracted In-Band SPS/PPS from frame #${checkFrameCount + 1}! sps=${sps.size}, pps=${pps.size}, startCodeLen=$startCode0Len"
                                             )
+                                            lastCsdSps = sps.copyOf()
+                                            lastCsdPps = pps.copyOf()
                                             codecConfigListener?.invoke(sps, pps)
+                                            try {
+                                                recordingSink?.onCsd(sps, pps)
+                                            } catch (e: Exception) {
+                                                Log.e(TAG, "RecordingSink.onCsd failed", e)
+                                            }
                                             csdSent = true
                                         } else if (type0 == 7 || type1 == 8) {
                                             if (checkFrameCount == 0L) {
@@ -1046,6 +1165,10 @@ class VideoEncoder(
                                 presentationTimeUs = bufferInfo.presentationTimeUs,
                                 captureEpochMs = capMs
                             )
+                            if (isKeyFrame) {
+                                lastKeyframeOutputTimeMs = System.currentTimeMillis()
+                                keyframeDroughtSyncRequestedAtMs = 0L
+                            }
 
                             // CRITICAL: Only fill internal frameQueue if someone is actually polling it
                             // The frameQueue is for legacy "pull-based" access via pollEncodedFrame()
@@ -1109,6 +1232,12 @@ class VideoEncoder(
                                         e
                                     )
                                 }
+                            }
+                            // Tee to recording sink (muxer); independent of frameListener so record-only with shared encoder works
+                            try {
+                                recordingSink?.onEncodedFrame(frame)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "RecordingSink.onEncodedFrame failed", e)
                             }
 
                             // frameCount already computed above for logging

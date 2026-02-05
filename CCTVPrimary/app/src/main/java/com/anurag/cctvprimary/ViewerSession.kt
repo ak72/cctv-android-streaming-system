@@ -7,7 +7,6 @@ import java.io.BufferedOutputStream
 import java.net.Socket
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicLong
 import java.security.SecureRandom
@@ -67,6 +66,10 @@ class ViewerSession(
     private var viewerCaps: ViewerCaps? = null
     private var pendingConfig: StreamConfig? = null
     var sessionId: String = java.util.UUID.randomUUID().toString()
+
+    /** Negotiated protocol version from HELLO. 2 = text line + payload; 3 = binary framed [header][payload] for video. */
+    @Volatile
+    private var protocolVersion: Int = 2
 
     /**
      * Stream epoch for this session.
@@ -137,8 +140,10 @@ class ViewerSession(
         class Csd(val sps: ByteArray, val pps: ByteArray) : ControlItem()
     }
     private val controlQueue = LinkedBlockingQueue<ControlItem>(CONTROL_QUEUE_CAPACITY)
-    /** STREAM_STATE (code, epoch) queue. Only the sender thread drains this and writes to the wire so ordering cannot regress. */
+    /** STREAM_STATE (code, epoch) queue. ViewerSession is the single authority that emits STREAM_STATE to the wire (StreamServer must only trigger via session.sendStreamState*(), never send STREAM_STATE directly). Sender thread drains and writes so ordering cannot regress. */
     private val streamStateQueue = LinkedBlockingQueue<Pair<Int, Long>>(32)
+    /** Atomic control batches: written in one task with one flush to prevent reorder/coalesce on some OEM kernels (e.g. STREAM_ACCEPTED + STREAM_STATE|2). Drained first in sender loop. */
+    private val atomicBatchQueue = LinkedBlockingQueue<List<String>>(16)
     private data class AudioItem(val pcm: ByteArray, val tsUs: Long, val rate: Int, val ch: Int, val isCompressed: Boolean) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -169,19 +174,8 @@ class ViewerSession(
     @Volatile
     private var senderRunning = false
     
-    // Thread management using Executors for proper lifecycle control
-    private val listenerExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ViewerSession-Listener").apply { isDaemon = true }
-    }
-    private val senderExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ViewerSession-VideoSender").apply { isDaemon = true }
-    }
-    private val audioSenderExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ViewerSession-AudioSender").apply { isDaemon = true }
-    }
-    private val heartbeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "ViewerSession-Heartbeat").apply { isDaemon = true }
-    }
+    // Use shared session pool to cap total session threads (StreamingExecutors.sessionPool)
+    private val sessionPool: ExecutorService get() = StreamingExecutors.sessionPool
     
 
 
@@ -202,7 +196,7 @@ class ViewerSession(
      * Protocol receive loop
      * =============================== */
     private fun listen() {
-        listenerExecutor.execute {
+        sessionPool.execute {
             try {
                 while (true) {
                     val line = ProtocolIO.readLineUtf8(input) ?: break
@@ -225,8 +219,12 @@ class ViewerSession(
             // Updating here prevents false disconnects and CE4->M30s reconnect loops.
             lastPingUptimeMs = SystemClock.uptimeMillis()
             when {
-                line.startsWith("HELLO|") -> {
-                    // Send CHAP challenge instead of simple HELLO_OK
+                line.startsWith("HELLO") -> {
+                    protocolVersion = 2
+                    if (line.contains("|")) {
+                        val params = parseParams(line)
+                        protocolVersion = params["version"]?.toIntOrNull()?.coerceIn(2, 3) ?: 2
+                    }
                     sendControl("AUTH_CHALLENGE|v=2|salt=$authSalt")
                 }
 
@@ -430,13 +428,28 @@ class ViewerSession(
         if (senderRunning) return
         senderRunning = true
 
-        senderExecutor.execute {
+        sessionPool.execute {
             try {
                 while (senderRunning) {
                     // Check if socket is still connected
                     if (socket.isClosed || state == StreamState.DISCONNECTED) break
 
-                    // 0. Drain STREAM_STATE queue first (single authority: only this thread writes state to wire)
+                    // 0. Drain atomic batches first — critical sequences (e.g. STREAM_ACCEPTED + STREAM_STATE|2) written in one flush to avoid reorder on some devices
+                    while (true) {
+                        val batch = atomicBatchQueue.poll() ?: break
+                        try {
+                            synchronized(writeLock) {
+                                if (socket.isClosed) throw java.net.SocketException("Closed")
+                                batch.forEach { writeLine(it) }
+                                out.flush()
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "[VIEWER SESSION] Atomic batch send error: ${e.message}")
+                            throw e
+                        }
+                    }
+
+                    // 1. Drain STREAM_STATE queue (single authority: only this thread writes state to wire)
                     while (true) {
                         val stateMsg = streamStateQueue.poll() ?: break
                         try {
@@ -450,8 +463,8 @@ class ViewerSession(
                             throw e
                         }
                     }
-                    
-                    // 1. Process Control Messages (High Priority)
+
+                    // 2. Process Control Messages (High Priority)
                     while (true) {
                         val ctl = controlQueue.poll() ?: break
                         try {
@@ -479,7 +492,7 @@ class ViewerSession(
                         }
                     }
 
-                    // 2. Process Video Frames
+                    // 3. Process Video Frames
                     var frame = frameQueue.poll(10, TimeUnit.MILLISECONDS) ?: continue
                     
                     // Skip stale frames logic...
@@ -503,16 +516,18 @@ class ViewerSession(
                     try {
                         synchronized(writeLock) {
                             if (socket.isClosed) throw java.net.SocketException("Closed")
-                            
-                            val srvMs = System.currentTimeMillis()
-                            val ageMs = if (frame.captureEpochMs > 0) (srvMs - frame.captureEpochMs).coerceAtLeast(0L) else -1L
-                            val seq = frameSeq.getAndIncrement()
-                            
-                            val frameLine = "FRAME|epoch=$streamEpoch|seq=$seq|size=${frame.data.size}|key=${frame.isKeyFrame}|tsUs=${frame.presentationTimeUs}|srvMs=$srvMs|capMs=${frame.captureEpochMs}|ageMs=$ageMs"
-                            
-                            writeLine(frameLine)
-                            out.write(frame.data)
-                            out.flush()
+                            if (protocolVersion >= 3) {
+                                ProtocolIO.writeBinaryVideoFrame(out, streamEpoch, frame.isKeyFrame, frame.data)
+                                out.flush()
+                            } else {
+                                val srvMs = System.currentTimeMillis()
+                                val ageMs = if (frame.captureEpochMs > 0) (srvMs - frame.captureEpochMs).coerceAtLeast(0L) else -1L
+                                val seq = frameSeq.getAndIncrement()
+                                val frameLine = "FRAME|epoch=$streamEpoch|seq=$seq|size=${frame.data.size}|key=${frame.isKeyFrame}|tsUs=${frame.presentationTimeUs}|srvMs=$srvMs|capMs=${frame.captureEpochMs}|ageMs=$ageMs"
+                                writeLine(frameLine)
+                                out.write(frame.data)
+                                out.flush()
+                            }
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "[VIEWER SESSION] Frame send error: ${e.message}")
@@ -531,7 +546,7 @@ class ViewerSession(
         }
         
         // --- AUDIO SENDER LOOP ---
-        audioSenderExecutor.execute {
+        sessionPool.execute {
             try {
                 while (senderRunning) {
                     if (socket.isClosed || state == StreamState.DISCONNECTED) break
@@ -575,20 +590,13 @@ class ViewerSession(
         frameQueue.clear()
         controlQueue.clear()
         streamStateQueue.clear()
+        atomicBatchQueue.clear()
 
         try {
             socket.close()
         } catch (_: Exception) {
         }
-        // Shutdown executors gracefully
-        try {
-            listenerExecutor.shutdownNow()
-            senderExecutor.shutdownNow()
-            audioSenderExecutor.shutdownNow() // Shutdown audio executor
-            heartbeatExecutor.shutdownNow()
-        } catch (_: Exception) {
-            Log.w(TAG, "[VIEWER SESSION] Executor shutdown error (ignored)")
-        }
+        // Do not shut down sessionPool — it is shared (StreamingExecutors)
         onSessionClosed(this)
     }
 
@@ -608,10 +616,12 @@ class ViewerSession(
         if (authenticated.compareAndSet(false, true)) {
             Log.d(TAG, "[VIEWER SESSION] Authentication successful — activating session")
             state = StreamState.AUTHENTICATED
-            sendControl("SESSION|id=$sessionId")
-            // Full state snapshot after AUTH so late joiners / reconnects never guess (STATE_MACHINE.md).
-            sendControl("PROTO|version=2")
-            scheduleStreamState(STREAM_STATE_RECONFIGURING, streamEpoch)
+            // Full state snapshot after AUTH in one atomic batch so order cannot regress on some OEM kernels (STATE_MACHINE.md).
+            sendControlAtomic(
+                "SESSION|id=$sessionId",
+                "PROTO|version=$protocolVersion",
+                "STREAM_STATE|$STREAM_STATE_RECONFIGURING|epoch=$streamEpoch"
+            )
             // Sender NOT started here - waiting for enableStreaming()
             onAuthenticated(this)
         } else {
@@ -637,7 +647,7 @@ class ViewerSession(
     }
 
     private fun startHeartbeatWatchdog() {
-        heartbeatExecutor.execute {
+        sessionPool.execute {
             try {
                 while (state != StreamState.DISCONNECTED) {
                     Thread.sleep(HEARTBEAT_CHECK_INTERVAL_MS)
@@ -671,11 +681,20 @@ class ViewerSession(
     }
 
     /**
+     * Send multiple control lines in one batch with one flush. Use for critical sequences (e.g. STREAM_ACCEPTED + STREAM_STATE|2)
+     * so they cannot be reordered or interleaved with frames on some OEM kernels. Sender thread drains atomicBatchQueue first.
+     */
+    fun sendControlAtomic(vararg messages: String) {
+        if (messages.isEmpty()) return
+        atomicBatchQueue.offer(messages.toList())
+    }
+
+    /**
      * Schedule STREAM_STATE to be sent from the sender thread only. Ensures a single authority path so ordering cannot regress
      * (e.g. ACTIVE then late RECONFIGURING). Call from listener or from outside (e.g. broadcast); sender thread drains and writes.
      */
     private fun scheduleStreamState(code: Int, epoch: Long) {
-        senderExecutor.execute { streamStateQueue.offer(Pair(code, epoch)) }
+        sessionPool.execute { streamStateQueue.offer(Pair(code, epoch)) }
     }
 
     /**
@@ -684,7 +703,7 @@ class ViewerSession(
      */
     fun sendStreamStateStopped() {
         val epoch = streamEpoch
-        senderExecutor.execute { streamStateQueue.offer(Pair(STREAM_STATE_STOPPED, epoch)) }
+        sessionPool.execute { streamStateQueue.offer(Pair(STREAM_STATE_STOPPED, epoch)) }
     }
 
     fun sendCsd(sps: ByteArray, pps: ByteArray) {

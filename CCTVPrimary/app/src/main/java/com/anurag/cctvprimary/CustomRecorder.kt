@@ -17,19 +17,21 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Custom Recorder
  * 
  * Replaces CameraX Recorder with custom MediaCodec/MediaMuxer implementation.
- * - Video: H.264 encoding from ImageAnalysis frames (like VideoEncoder)
+ * - Video: H.264 encoding from ImageAnalysis frames (like VideoEncoder), or external (tee from VideoEncoder)
  * - Audio: AAC encoding from AudioSourceEngine PCM data
  * - Output: MP4 file via MediaMuxer
  * 
- * This allows simultaneous recording with audio and streaming audio without mic conflicts.
+ * When [useExternalVideo] is true, no video codec is created; video is fed via [RecordingSink]
+ * from the shared VideoEncoder (single graph: one encoder → stream + record). Avoids camera rebind.
  */
 class CustomRecorder(
     private val width: Int,
     private val height: Int,
     private val videoBitrate: Int,
     private val frameRate: Int,
-    private val audioSampleRate: Int = 48000
-) : AudioSourceEngine.AudioListener {
+    private val audioSampleRate: Int = 48000,
+    private val useExternalVideo: Boolean = false
+) : AudioSourceEngine.AudioListener, RecordingSink {
     
     private val logFrom = "CustomRecorder"
     private val TIMEOUT_US = 10_000L
@@ -146,10 +148,14 @@ class CustomRecorder(
         this.fileDescriptor = fileDescriptor
         
         try {
-            // Setup video codec
-            Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Setting up video codec...")
-            setupVideoCodec()
-            Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Video codec setup completed")
+            // Setup video codec (skip when using external video from shared VideoEncoder)
+            if (!useExternalVideo) {
+                Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Setting up video codec...")
+                setupVideoCodec()
+                Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Video codec setup completed")
+            } else {
+                Log.d(logFrom, "🔴 [CUSTOM_RECORDER] External video mode: skipping video codec (will receive CSD/frames from VideoEncoder)")
+            }
             
             // Setup audio codec if needed
             if (withAudio) {
@@ -244,11 +250,11 @@ class CustomRecorder(
         // signalEndOfInputStream() only works for Surface-based input, but we use ByteBuffer input
         // For ByteBuffer input, we must queue an empty buffer with BUFFER_FLAG_END_OF_STREAM
         
-        // Signal EOS to video codec (ByteBuffer input)
+        // Signal EOS to video codec (ByteBuffer input); skip when using external video (no codec)
         // CRITICAL: Codec must be in executing state to accept input buffers
         // If codec is already stopped/released, skip EOS signaling
         try {
-            val codec = videoCodec
+            val codec = if (useExternalVideo) null else videoCodec
             if (codec != null) {
                 try {
                     val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
@@ -391,6 +397,54 @@ class CustomRecorder(
         Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Recording stopped successfully")
     }
     
+    // ---------- RecordingSink (external video from VideoEncoder) ----------
+    
+    override fun onCsd(sps: ByteArray, pps: ByteArray) {
+        if (!useExternalVideo) return
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setByteBuffer("csd-0", ByteBuffer.wrap(sps))
+            setByteBuffer("csd-1", ByteBuffer.wrap(pps))
+        }
+        synchronized(muxerLock) {
+            if (videoTrackIndex == -1 && mediaMuxer != null) {
+                videoTrackIndex = mediaMuxer!!.addTrack(format)
+                videoFormatReceived.set(true)
+                Log.d(logFrom, "🔴 [CUSTOM_RECORDER] External video: added track from CSD, trackIndex=$videoTrackIndex")
+                startMuxerIfReady()
+            }
+        }
+    }
+    
+    override fun onEncodedFrame(frame: EncodedFrame) {
+        if (!useExternalVideo) return
+        if (frame.data.isEmpty()) return
+        synchronized(muxerLock) {
+            if (!muxerStarted || videoTrackIndex < 0) return
+            val codecOutputPts = frame.presentationTimeUs
+            if (firstVideoPts < 0) {
+                firstVideoPts = codecOutputPts
+            }
+            val normalizedPts = (codecOutputPts - firstVideoPts).coerceAtLeast(0L)
+            val minStepUs = 1L
+            val finalPts = if (normalizedPts > lastWrittenVideoPts) normalizedPts else lastWrittenVideoPts + minStepUs
+            lastWrittenVideoPts = finalPts
+            val bufferInfo = MediaCodec.BufferInfo().apply {
+                offset = 0
+                size = frame.data.size
+                presentationTimeUs = finalPts
+                flags = if (frame.isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+            }
+            try {
+                val buffer = ByteBuffer.wrap(frame.data)
+                mediaMuxer?.writeSampleData(videoTrackIndex, buffer, bufferInfo)
+                videoOutputFrameCount++
+            } catch (e: Exception) {
+                Log.e(logFrom, "🔴 [CUSTOM_RECORDER] External video write failed", e)
+                if (e is IllegalStateException) muxerStarted = false
+            }
+        }
+    }
+    
     /**
      * Encode a video frame (called from ImageAnalysis)
      */
@@ -404,6 +458,11 @@ class CustomRecorder(
             }
         }
         if (!isRecording) {
+            closeIfNeeded()
+            return
+        }
+        if (useExternalVideo) {
+            // Video comes from VideoEncoder via RecordingSink; ignore ImageProxy frames
             closeIfNeeded()
             return
         }

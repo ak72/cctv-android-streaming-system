@@ -6,6 +6,8 @@ import android.media.AudioFormat
 internal const val DECODE_TIMEOUT_US: Long = 10_000L
 internal const val BACKPRESSURE_COOLDOWN_US: Long = 1_000_000L
 internal const val HEARTBEAT_PING_INTERVAL_MS: Long = 2_000L
+/** If no STREAM_STATE from server for this long while we trust server authority, downgrade to RECOVERING (authority liveness validation). */
+internal const val STREAM_STATE_FRESHNESS_TIMEOUT_MS: Long = 12_000L
 internal const val CONNECT_TIMEOUT_MS: Int = 6_000
 internal const val SOCKET_READ_TIMEOUT_MS: Int = 15_000
 

@@ -173,10 +173,10 @@ class StreamClient(
     @Volatile private var lastSeqGapLogMs: Long = 0L
 
     // --- Server authoritative state (CRITICAL #4 / STATE_MACHINE.md) ---
-    // When server sends STREAM_STATE we obey; inference (CSD/STREAM_ACCEPTED/frame render) is fallback only when server is silent.
+    // Connection state is driven only by STREAM_STATE from server. Decoder events (CSD, first frame rendered) are telemetry only and must never change connection state.
     @Volatile private var serverSupportsStreamState: Boolean = false
     @Volatile private var lastStreamStateFromServerUptimeMs: Long = 0L
-    /** Single guard: may we infer RECOVERING/STREAMING/CONNECTED from inference or watchdog? Binary authority only (no timeout). When server sends STREAM_STATE we never infer. */
+    /** When true, handshake/watchdog may downgrade UI (e.g. AUTHENTICATED→CONNECTED, STREAMING→RECOVERING). When server sends STREAM_STATE we never infer from decoder. */
     private fun canInferState(): Boolean = !serverSupportsStreamState
 
     // --- Handshake / startup tracking ---
@@ -926,10 +926,14 @@ class StreamClient(
                         val params = parseParams(line)
                         val code = line.substringAfter("STREAM_STATE|").substringBefore("|").toIntOrNull() ?: 0
                         val msgEpoch = params["epoch"]?.toLongOrNull()
-                        val nowUptime = android.os.SystemClock.uptimeMillis()
-                        lastStreamStateFromServerUptimeMs = nowUptime
-                        if (msgEpoch != null && msgEpoch > 0L) streamEpoch = msgEpoch
-                        when (code) {
+                        // Monotonic epoch: ignore stale STREAM_STATE (e.g. ACTIVE(5) arriving after RECONFIGURING(6)) to avoid decoder mismatch.
+                        if (msgEpoch != null && msgEpoch > 0L && msgEpoch < streamEpoch) {
+                            Log.d(logFrom, "[Stream Client] STREAM_STATE ignored — stale epoch $msgEpoch < current $streamEpoch (code=$code)")
+                        } else {
+                            val nowUptime = android.os.SystemClock.uptimeMillis()
+                            lastStreamStateFromServerUptimeMs = nowUptime
+                            if (msgEpoch != null && msgEpoch > 0L) streamEpoch = msgEpoch
+                            when (code) {
                             1 -> {
                                 Log.d(logFrom, "[Stream Client] STREAM_STATE ACTIVE (epoch=$msgEpoch) — posting STREAMING")
                                 postState(ConnectionState.STREAMING)
@@ -943,11 +947,12 @@ class StreamClient(
                                 postState(ConnectionState.CONNECTED)
                             }
                             4 -> {
-                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — stream intentionally ended; disconnecting")
-                                postState(ConnectionState.DISCONNECTED)
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — posting IDLE then disconnecting")
+                                postState(ConnectionState.IDLE)
                                 disconnectForRecovery("server_stopped")
                             }
                             else -> Log.w(logFrom, "[Stream Client] STREAM_STATE unknown code=$code")
+                            }
                         }
                     }
 
@@ -1225,18 +1230,12 @@ class StreamClient(
                         val srvMs = params["srvMs"]?.toLongOrNull() ?: -1L
                         val capMs = params["capMs"]?.toLongOrNull() ?: -1L
                         val ageMs = params["ageMs"]?.toLongOrNull() ?: -1L
-                        // Drop frames from old epochs to prevent mixing across reconfigure/reconnect.
+                        // Hard gate: drop any frame whose epoch does not match current. Prevents decoder configured for one config (e.g. 720p) from receiving data from another (e.g. 1080p) after recording restart / camera rebind / resolution change. No log — just drop.
                         if (streamEpoch > 0L && msgEpoch > 0L && msgEpoch != streamEpoch) {
-                            // Still must drain the binary payload to keep protocol framing correct.
                             if (size > 0) {
                                 val sink = ByteArrayPool.get(size)
                                 readFullyFromSocket(sink)
                                 ByteArrayPool.recycle(sink)
-                            }
-                            val nowMs = System.currentTimeMillis()
-                            if (nowMs - lastDropNonKeyWhileWaitingLogMs >= 2_000L) {
-                                lastDropNonKeyWhileWaitingLogMs = nowMs
-                                Log.w(logFrom, "[Stream Client] ⚠️ [EPOCH] Dropping FRAME from old epoch=$msgEpoch (currentEpoch=$streamEpoch) size=$size key=$isKeyFrame")
                             }
                             continue
                         }
@@ -1616,10 +1615,8 @@ class StreamClient(
                                     val started = startDecoderIfReady(forceWidth = newWidth, forceHeight = newHeight)
                                     Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] startDecoderIfReady() after resolution change reset: $started")
                                 }
-                                if (canInferState()) {
-                                    postState(ConnectionState.RECOVERING)
-                                    Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] Posted RECOVERING state due to resolution change (decoder existed)")
-                                }
+                                // Decoder/CSD events are telemetry only; connection state from STREAM_STATE only.
+                                Log.d(logFrom, "[Stream Client] 📊 [TELEMETRY] Resolution change / CSD (decoder existed); state from STREAM_STATE only")
                             } else {
                                 // Resolution change but decoder doesn't exist yet - don't post RECOVERING
                                 // Decoder will be configured with new resolution when it starts
@@ -2598,18 +2595,9 @@ class StreamClient(
                             }
                             // Mark render activity for watchdog/state correctness.
                             lastFrameRenderUptimeMs = android.os.SystemClock.uptimeMillis()
-                            // UI-state correctness:
-                            // We can legitimately enter RECOVERING during stalls/reconfigure windows even while the TCP
-                            // connection stays alive. If we are visibly rendering again, we must promote back to STREAMING,
-                            // otherwise the UI can show video while state remains RECOVERING.
-                            // Only infer STREAMING when server doesn't send STREAM_STATE (fallback for old Primaries).
-                            try {
-                                if (currentState == ConnectionState.RECOVERING && canInferState()) {
-                                    Log.d(logFrom, "[Stream Client] ✅ [STATE] Frame rendered while RECOVERING -> posting STREAMING (inference)")
-                                    postState(ConnectionState.STREAMING)
-                                }
-                            } catch (t: Throwable) {
-                                Log.w(logFrom, "[Stream Client] Failed to promote RECOVERING->STREAMING on render (non-fatal)", t)
+                            // Decoder events are telemetry only; connection state comes only from STREAM_STATE (no inference).
+                            if (currentState == ConnectionState.RECOVERING) {
+                                Log.d(logFrom, "[Stream Client] 📊 [TELEMETRY] Frame rendered while RECOVERING (state from STREAM_STATE only)")
                             }
 
                             if (!postedFirstFrameRendered) {
@@ -2627,13 +2615,9 @@ class StreamClient(
                                             logFrom,
                                             "🔵 [DECODER] Nord CE4: stable frames reached ($nordCe4RenderedFramesAfterWarmup) -> invoking onFirstFrameRendered"
                                         )
-                                        try {
-                                            if (currentState != ConnectionState.STREAMING && canInferState()) {
-                                                Log.d(logFrom, "[Stream Client] ✅ [STATE] First stable rendered frames -> posting STREAMING (inference)")
-                                                postState(ConnectionState.STREAMING)
-                                            }
-                                        } catch (t: Throwable) {
-                                            Log.w(logFrom, "[Stream Client] Failed to post STREAMING on first stable render (non-fatal)", t)
+                                        // Decoder events are telemetry only; connection state from STREAM_STATE only.
+                                        if (currentState != ConnectionState.STREAMING) {
+                                            Log.d(logFrom, "[Stream Client] 📊 [TELEMETRY] First stable rendered frames (state from STREAM_STATE only)")
                                         }
                                         mainHandler.post {
                                             Log.d(logFrom, "[Stream Client] 🔵 [DECODER] onFirstFrameRendered callback running on main thread")
@@ -2655,13 +2639,9 @@ class StreamClient(
                                                 logFrom,
                                                 "⚠️ [NORD_CE4] Fallback reveal: forcing first-frame rendered after ${renderAttemptAgeMs}ms of render attempts (stableFrames=$nordCe4RenderedFramesAfterWarmup)"
                                             )
-                                            try {
-                                                if (currentState != ConnectionState.STREAMING && canInferState()) {
-                                                    Log.d(logFrom, "[Stream Client] ✅ [STATE] Fallback reveal -> posting STREAMING (inference)")
-                                                    postState(ConnectionState.STREAMING)
-                                                }
-                                            } catch (t: Throwable) {
-                                                Log.w(logFrom, "[Stream Client] Failed to post STREAMING on fallback reveal (non-fatal)", t)
+                                            // Decoder events are telemetry only; connection state from STREAM_STATE only.
+                                            if (currentState != ConnectionState.STREAMING) {
+                                                Log.d(logFrom, "[Stream Client] 📊 [TELEMETRY] Fallback reveal (state from STREAM_STATE only)")
                                             }
                                             mainHandler.post {
                                                 Log.d(logFrom, "[Stream Client] 🔵 [DECODER] onFirstFrameRendered callback running on main thread (fallback reveal)")
@@ -2687,14 +2667,9 @@ class StreamClient(
                                         logFrom,
                                         "🔵 [DECODER] First frame rendered! Invoking onFirstFrameRendered callback"
                                     )
-                                    // Now that we have proven real rendering, we can safely declare STREAMING (only when server doesn't send STREAM_STATE).
-                                    try {
-                                        if (currentState != ConnectionState.STREAMING && canInferState()) {
-                                            Log.d(logFrom, "[Stream Client] ✅ [STATE] First rendered frame -> posting STREAMING (inference)")
-                                            postState(ConnectionState.STREAMING)
-                                        }
-                                    } catch (t: Throwable) {
-                                        Log.w(logFrom, "[Stream Client] Failed to post STREAMING on first render (non-fatal)", t)
+                                    // Decoder events are telemetry only; connection state from STREAM_STATE only.
+                                    if (currentState != ConnectionState.STREAMING) {
+                                        Log.d(logFrom, "[Stream Client] 📊 [TELEMETRY] First rendered frame (state from STREAM_STATE only)")
                                     }
                                     mainHandler.post {
                                         Log.d(logFrom, "[Stream Client] 🔵 [DECODER] onFirstFrameRendered callback running on main thread")
@@ -3185,9 +3160,9 @@ class StreamClient(
             if (lastFrameRxUptimeMs > 0L) (nowUptimeMs - lastFrameRxUptimeMs) else Long.MAX_VALUE
         val state = currentState
 
-        // Never send protocol commands when not connected.
+        // Never send protocol commands when not connected (or when IDLE — stream stopped, about to disconnect).
         // Surface can be attached before connect() due to Compose keeping SurfaceView alive.
-        if (state == ConnectionState.DISCONNECTED || socket == null || out == null) {
+        if (state == ConnectionState.DISCONNECTED || state == ConnectionState.IDLE || socket == null || out == null) {
             Log.d(logFrom, "[Stream Client] REQ_KEYFRAME skipped (not connected): reason=$reason state=$state socket=${socket != null} out=${out != null}")
             return
         }
@@ -3968,6 +3943,18 @@ class StreamClient(
         try {
             val state = currentState
             if (state != ConnectionState.STREAMING && state != ConnectionState.RECOVERING) return
+
+            // Authority liveness: if server sends STREAM_STATE, we must see it periodically or downgrade (server/encoder/camera may be stuck).
+            if (serverSupportsStreamState && lastStreamStateFromServerUptimeMs > 0L) {
+                val sinceLastState = nowUptimeMs - lastStreamStateFromServerUptimeMs
+                if (sinceLastState >= STREAM_STATE_FRESHNESS_TIMEOUT_MS) {
+                    Log.w(logFrom, "[Stream Client] ⚠️ [AUTHORITY] No STREAM_STATE for ${sinceLastState}ms — downgrading to RECOVERING (liveness validation)")
+                    postState(ConnectionState.RECOVERING)
+                    requestKeyframe("authority_freshness")
+                    return
+                }
+            }
+
             val inGrace = inReconfigureGrace(nowUptimeMs)
 
             val lastActivity = maxOf(lastFrameRxUptimeMs, lastFrameRenderUptimeMs)

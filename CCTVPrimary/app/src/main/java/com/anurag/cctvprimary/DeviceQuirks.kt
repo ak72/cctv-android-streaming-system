@@ -3,19 +3,16 @@ package com.anurag.cctvprimary
 import android.os.Build
 
 /**
- * Central registry for *confirmed* vendor/device bugs.
+ * Legacy registry for vendor/device display only.
  *
- * Policy:
- * - Prefer capability detection + runtime probing.
- * - Only keep small, well-justified model/manufacturer checks here (not scattered).
+ * Pipeline behavior is driven by [CameraHardwareLevelPolicy] (hardware level + capabilities), not brand.
+ * This quirk is only used for UI "device forces buffer" display; encoder/profile do not call it.
  */
 internal object DeviceQuirks {
 
     /**
-     * Some devices are known to behave badly with CameraX -> MediaCodec Surface input pipelines
-     * (e.g. multi-surface issues, HAL deadlocks, or silent stalls).
-     *
-     * Keep this list SMALL and only for confirmed production bugs.
+     * Used by UI only (e.g. to show "forced by device" on known models).
+     * Pipeline uses DeviceProfile.preferBufferMode (from hardware level), not this.
      */
     fun forceBufferInputMode(): Boolean {
         val manu = (Build.MANUFACTURER ?: "").lowercase()

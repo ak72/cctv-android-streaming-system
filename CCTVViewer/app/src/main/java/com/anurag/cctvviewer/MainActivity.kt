@@ -156,6 +156,7 @@ private fun derivePlaybackState(
         ConnectionState.RECOVERING -> PlaybackState.Rebuffering
         // STREAMING but no visible frame: treat as buffering (Surface warmup, keyframe wait, PixelCopy gating).
         ConnectionState.STREAMING -> PlaybackState.Buffering
+        ConnectionState.IDLE -> PlaybackState.Idle
     }
 }
 
@@ -657,14 +658,14 @@ class MainActivity : ComponentActivity() {
                         ) {
                             try {
                                 if (!useSurfaceView) return@LaunchedEffect
-                                if (state < ConnectionState.STREAMING) return@LaunchedEffect
+                                if (state != ConnectionState.STREAMING && state != ConnectionState.RECOVERING) return@LaunchedEffect
                                 if (!decoderReportedFirstRender) return@LaunchedEffect
                                 if (hasPreviewFrame) return@LaunchedEffect
 
                                 // Give PixelCopy a moment to validate pixels; then force-reveal to avoid permanent blocking.
                                 delay(2500)
 
-                                if (useSurfaceView && state >= ConnectionState.STREAMING && decoderReportedFirstRender && !hasPreviewFrame) {
+                                if (useSurfaceView && (state == ConnectionState.STREAMING || state == ConnectionState.RECOVERING) && decoderReportedFirstRender && !hasPreviewFrame) {
                                     Log.w(
                                         "CCTV_VIEWER",
                                         "[VIEWER MA] ⚠️ [SURFACE] SurfaceView render detected but PixelCopy did not confirm within grace window; forcing preview reveal to avoid 'Starting stream' lock"
@@ -702,7 +703,7 @@ class MainActivity : ComponentActivity() {
                             // 2 seconds was too aggressive on some devices during first connect / resume.
                             // Give the decoder + encoder time to negotiate and deliver the first keyframe.
                             delay(5000)
-                            if (state >= ConnectionState.STREAMING && !hasPreviewFrame && !autoFallbackAttempted) {
+                            if ((state == ConnectionState.STREAMING || state == ConnectionState.RECOVERING) && !hasPreviewFrame && !autoFallbackAttempted) {
                                 @Suppress("UNUSED_VALUE")
                                 autoFallbackAttempted = true
                                 val newMode = true // TextureView -> SurfaceView only
@@ -1019,6 +1020,7 @@ class MainActivity : ComponentActivity() {
                                             ConnectionState.CONNECTED -> stringResource(R.string.state_connected)
                                             ConnectionState.RECOVERING -> stringResource(R.string.state_recovering)
                                             ConnectionState.STREAMING -> stringResource(R.string.state_streaming)
+                                            ConnectionState.IDLE -> stringResource(R.string.state_idle_stream_stopped)
                                         },
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.onBackground

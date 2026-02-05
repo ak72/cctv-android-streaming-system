@@ -338,9 +338,10 @@ class CameraForegroundService : LifecycleService() {
             currentFPS = top.fps
             currentBitrate = top.bitrate.coerceAtMost(p.maxRecommendedBitrateBps)
 
-            // Prefer fixed FPS from profile to keep sensor/AE stable.
-            cameraFpsGovernorCap = p.chosenFixedFps
-            cameraFpsCeiling = p.chosenFixedFps
+            // Prefer fixed FPS from profile; cap at FPS_CAP_LOW_TIER when FPS governor not allowed (LIMITED/LEGACY).
+            val fpsCap = if (p.allowFpsGovernor) p.chosenFixedFps else minOf(p.chosenFixedFps, CameraHardwareLevelPolicy.FPS_CAP_LOW_TIER)
+            cameraFpsGovernorCap = fpsCap
+            cameraFpsCeiling = fpsCap
             cameraFpsRange = p.chosenAeFpsRange
             // Force recompute if resolution changes later.
             cameraFpsComputedForW = 0
@@ -527,6 +528,7 @@ class CameraForegroundService : LifecycleService() {
 
     private fun startBitrateRecoveryGovernor() {
         if (bitrateGovernorRunning) return
+        if (deviceProfile?.allowDynamicBitrate == false) return
         bitrateGovernorRunning = true
         Log.d(logFrom, "AIMD: Starting bitrate recovery governor")
         rebindHandler.postDelayed(bitrateRecoveryRunnable, BITRATE_INC_INTERVAL_MS)
@@ -578,18 +580,13 @@ class CameraForegroundService : LifecycleService() {
     @Volatile
     private var isStreamingAudio = false
 
-    private lateinit var cameraExecutor: java.util.concurrent.ExecutorService
+    private val cameraExecutor: java.util.concurrent.ExecutorService get() = StreamingExecutors.controlExecutor
 
-    // Dedicated executor for ImageAnalysis analyzer work.
-    // CRITICAL: Avoid running analyzer on the shared cameraExecutor to prevent occasional stalls
-    // (which show up as 10/15fps gaps in recording even when camera is configured for 30fps).
-    private lateinit var analysisExecutor: java.util.concurrent.ExecutorService
+    // Dedicated executor for ImageAnalysis (shared encodingExecutor). Kept separate from cameraExecutor to prevent stalls.
+    private val analysisExecutor: java.util.concurrent.ExecutorService get() = StreamingExecutors.encodingExecutor
 
     // CRITICAL: stopRecording() can block (draining codecs + muxer.stop), so never run it on UI thread.
-    private val recordingControlExecutor: java.util.concurrent.ExecutorService =
-        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-            Thread(r, "CFS-RecordingControl").apply { isDaemon = true }
-        }
+    private val recordingControlExecutor: java.util.concurrent.ExecutorService get() = StreamingExecutors.controlExecutor
 
     @Volatile
     private var stopRecordingInProgress: Boolean =
@@ -736,19 +733,6 @@ class CameraForegroundService : LifecycleService() {
 
 
         Log.d(logFrom, "CameraForegroundService created")
-        cameraExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-        analysisExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-            Thread({
-                try {
-                    // Favor smooth camera frame processing; safe no-op if it fails.
-                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
-                } catch (_: Throwable) {
-                }
-                r.run()
-            }, "CFS-ImageAnalysis").apply {
-                isDaemon = true
-            }
-        }
         // Foreground service start (Android 14+/targetSdk 34+ enforcement):
         // If we claim microphone FGS type without meeting eligibility + permissions, Android throws
         // a SecurityException and the process crashes. Video streaming must remain stable, so we
@@ -970,16 +954,7 @@ class CameraForegroundService : LifecycleService() {
         }
         stopTalkback()
         stopStreamingAudio()
-        try {
-            cameraExecutor.shutdownNow()
-        } catch (_: Exception) {
-            Log.w(logFrom, "Camera executor shutdown error (ignored)")
-        }
-        try {
-            analysisExecutor.shutdownNow()
-        } catch (_: Exception) {
-            Log.w(logFrom, "Analysis executor shutdown error (ignored)")
-        }
+        // Do not shut down cameraExecutor/analysisExecutor — they are shared (StreamingExecutors)
         stopEncoder()
         try {
             streamServer?.stop()
@@ -1628,30 +1603,17 @@ class CameraForegroundService : LifecycleService() {
                         } else {
                             Log.e(logFrom, "❌ [DIAGNOSTIC] Camera binding returned null!")
                         }
-                        // Samsung M30s (Android 11) low-light behavior:
-                        // A strict 30fps fixed AE range can force short exposures and make preview/recording look dark.
-                        // Prefer a lower FPS ceiling to allow longer exposure times (brighter output), especially on Exynos.
-                        try {
-                            val manu = Build.MANUFACTURER?.lowercase() ?: ""
-                            val model = Build.MODEL ?: ""
-                            val isSamsungAndroid11 = manu == "samsung" && Build.VERSION.SDK_INT == Build.VERSION_CODES.R
-                            val isM30Family =
-                                model.contains("M30s", ignoreCase = true) ||
-                                    model.contains("SM-M307", ignoreCase = true) ||
-                                    model.contains("M31", ignoreCase = true) ||
-                                    model.contains("M32", ignoreCase = true)
-                            if (isSamsungAndroid11 && isM30Family && cameraFpsGovernorCap > 24) {
-                                cameraFpsGovernorCap = 24
-                                // Force re-selection under the new cap.
-                                cameraFpsRange = null
-                                cameraFpsComputedForW = 0
-                                cameraFpsComputedForH = 0
-                                Log.w(
-                                    logFrom,
-                                    "🟠 [CAMERA FPS] Samsung Android11 default FPS cap set to 24 for brighter exposure (model=$model)"
-                                )
-                            }
-                        } catch (_: Throwable) {
+                        // LIMITED/LEGACY: cap FPS at 24 for pipeline stress and brighter exposure (hardware-level policy, no brand checks).
+                        val prof = deviceProfile
+                        if (prof != null && !prof.allowFpsGovernor && cameraFpsGovernorCap > CameraHardwareLevelPolicy.FPS_CAP_LOW_TIER) {
+                            cameraFpsGovernorCap = CameraHardwareLevelPolicy.FPS_CAP_LOW_TIER
+                            cameraFpsRange = null
+                            cameraFpsComputedForW = 0
+                            cameraFpsComputedForH = 0
+                            Log.d(
+                                logFrom,
+                                "🟠 [CAMERA FPS] Hardware-level LIMITED/LEGACY: FPS cap set to ${CameraHardwareLevelPolicy.FPS_CAP_LOW_TIER}"
+                            )
                         }
                         applyCameraControls()
                         // Start governor once camera is active; it will no-op when IDLE.
@@ -1726,15 +1688,16 @@ class CameraForegroundService : LifecycleService() {
         // even before onRecordingStarted callback updates serviceState.
         recordingRequested = true
 
-        // CRITICAL FIX: Create CustomRecorder FIRST (before file setup)
+        // When VideoEncoder already exists (streaming), use it as single video source (tee to muxer).
+        // Avoids camera rebind and second encoder; recorder receives CSD/frames via RecordingSink.
+        val useExternalVideo = (videoEncoder != null)
+
+        // CRITICAL FIX: Create CustomRecorder FIRST (before file setup) when we need ImageAnalysis
         // This is needed because bindCamera() checks customRecorder != null to decide if ImageAnalysis should be created
         // Once CustomRecorder exists, we rebind camera, which will create ImageAnalysis since customRecorder != null
-        // Then we proceed with file setup and start recording
-
-        // Create CustomRecorder placeholder (will be configured fully before start())
-        // We need it to exist before bindCamera so ImageAnalysis gets created
+        // When useExternalVideo we skip rebind (encoder already feeding stream; we'll tee to recorder).
         var tempRecorderCreated = false
-        if (imageAnalysis == null || currentCamera == null) {
+        if (!useExternalVideo && (imageAnalysis == null || currentCamera == null)) {
             Log.w(
                 logFrom,
                 "🔴 [RECORDING] WARNING: imageAnalysis or camera is null - creating CustomRecorder first, then rebinding camera"
@@ -1768,7 +1731,8 @@ class CameraForegroundService : LifecycleService() {
                 width = tempRecordingWidth,
                 height = tempRecordingHeight,
                 videoBitrate = currentBitrate,
-                frameRate = currentFPS
+                frameRate = currentFPS,
+                useExternalVideo = false
             )
             tempRecorderCreated = true
             Log.d(
@@ -1792,8 +1756,8 @@ class CameraForegroundService : LifecycleService() {
             }
         }
 
-        // Double-check after rebind attempt
-        if (imageAnalysis == null) {
+        // Double-check after rebind attempt (when not using external video, we need ImageAnalysis)
+        if (!useExternalVideo && imageAnalysis == null) {
             Log.e(
                 logFrom,
                 "🔴 [RECORDING] startRecording FAILED - imageAnalysis is still null after rebind attempt"
@@ -1911,13 +1875,21 @@ class CameraForegroundService : LifecycleService() {
             // 1. Try Surface Mode first (higher resolution, better quality) if device supports it
             // 2. Fall back to Buffer Mode only if device requires it (problematic devices)
             // 3. For Buffer Mode, use higher resolution if possible (check ImageAnalysis capabilities)
-            val forceBufferMode = AppSettings.isForceBufferMode(this)
+            val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true)
             val isBufferMode = VideoEncoder.shouldPreferBufferMode(this, forceBufferMode)
 
             val recordingWidth: Int
             val recordingHeight: Int
 
-            if (isBufferMode) {
+            if (useExternalVideo) {
+                // Match encoder output (stream dimensions)
+                recordingWidth = currentWidth
+                recordingHeight = currentHeight
+                Log.d(
+                    logFrom,
+                    "🔴 [RECORDING] External video: using encoder dimensions ${recordingWidth}x${recordingHeight}"
+                )
+            } else if (isBufferMode) {
                 // Buffer Mode: Device requires Buffer Mode (problematic device or forced)
                 // IMPORTANT (FOV/geometry consistency):
                 // On some devices (e.g., Samsung M30s), ImageAnalysis may deliver sizes like 720x540. If we "align down"
@@ -1962,11 +1934,12 @@ class CameraForegroundService : LifecycleService() {
                     width = recordingWidth,
                     height = recordingHeight,
                     videoBitrate = currentBitrate,
-                    frameRate = currentFPS
+                    frameRate = currentFPS,
+                    useExternalVideo = useExternalVideo
                 )
                 Log.d(
                     logFrom,
-                    "🔴 [RECORDING] CustomRecorder created with dimensions: ${recordingWidth}x${recordingHeight}"
+                    "🔴 [RECORDING] CustomRecorder created with dimensions: ${recordingWidth}x${recordingHeight}, useExternalVideo=$useExternalVideo"
                 )
             } else {
                 // CRITICAL FIX: Always recreate CustomRecorder if tempRecorderCreated is true
@@ -2004,7 +1977,8 @@ class CameraForegroundService : LifecycleService() {
                         width = recordingWidth,
                         height = recordingHeight,
                         videoBitrate = currentBitrate,
-                        frameRate = currentFPS
+                        frameRate = currentFPS,
+                        useExternalVideo = useExternalVideo
                     )
                     Log.d(
                         logFrom,
@@ -2047,6 +2021,7 @@ class CameraForegroundService : LifecycleService() {
                     if (error != null) {
                         Log.e(logFrom, "CustomRecorder stopped with error", error)
                     }
+                    videoEncoder?.setRecordingSink(null)
                     recordingWithAudio = false
                     serviceState = ServiceCaptureState.PREVIEW
                     recordingRequested = false
@@ -2110,6 +2085,10 @@ class CameraForegroundService : LifecycleService() {
             } catch (_: Throwable) {
             }
             val started = customRecorder!!.start(finalFileDescriptor, withAudio, orientationHint)
+            if (started && useExternalVideo) {
+                videoEncoder?.setRecordingSink(customRecorder)
+                Log.d(logFrom, "🔴 [RECORDING] External video: VideoEncoder recording sink set")
+            }
             if (!started) {
                 Log.e(
                     logFrom,
@@ -2489,6 +2468,7 @@ class CameraForegroundService : LifecycleService() {
      */
     private fun startCameraFpsGovernor() {
         if (cameraFpsGovernorRunning) return
+        if (deviceProfile?.allowFpsGovernor == false) return
         cameraFpsGovernorRunning = true
         Log.d(
             logFrom,
@@ -2859,7 +2839,7 @@ class CameraForegroundService : LifecycleService() {
     /*Encoding*/ private fun startEncoder() {
         if (videoEncoder != null) return
 
-        val forceBufferMode = AppSettings.isForceBufferMode(this) || forceBufferModeDueToCameraXCombo
+        val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true) || forceBufferModeDueToCameraXCombo
 
         // Detect if Buffer Mode will be active (manual override or problematic device)
         val willUseBufferMode = VideoEncoder.shouldPreferBufferMode(this, forceBufferMode)
@@ -2928,6 +2908,23 @@ class CameraForegroundService : LifecycleService() {
                 }
             }
         })
+        videoEncoder?.setOnRecoveryNeeded {
+            // Invoked from encoder drain thread; post to main and restart so pipeline cannot stall permanently.
+            rebindHandler.post {
+                if (videoEncoder != null) {
+                    Log.w(
+                        logFrom,
+                        "🔴 [ENCODER RECOVERY] Encoder requested recovery (stuck or keyframe drought). Restarting encoder."
+                    )
+                    val hadRecorder = customRecorder
+                    stopEncoder()
+                    startEncoder()
+                    if (hadRecorder != null) {
+                        videoEncoder?.setRecordingSink(hadRecorder)
+                    }
+                }
+            }
+        }
         Log.d(logFrom, "SetEncodedFrameListener initialized for sendFrame")
 
         videoEncoder?.start()
@@ -3682,7 +3679,7 @@ class CameraForegroundService : LifecycleService() {
         // trigger a native crash (SIGSEGV / status=11) in vendor MediaCodec / camera HAL.
         // For those devices we prefer stability: keep a fixed encoder resolution (Buffer Mode) and only adjust
         // bitrate at runtime (MediaCodec.setParameters), ignoring viewer-driven width/height/fps changes.
-        val forceBufferMode = AppSettings.isForceBufferMode(this)
+        val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true)
         val willUseBufferMode = VideoEncoder.shouldPreferBufferMode(this, forceBufferMode)
         if (willUseBufferMode) {
             // Resolve the fixed buffer-mode encoder resolution based on requested orientation.

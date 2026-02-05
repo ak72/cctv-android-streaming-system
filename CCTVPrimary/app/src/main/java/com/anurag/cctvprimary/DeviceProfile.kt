@@ -32,8 +32,10 @@ internal data class DeviceProfile(
     val hasAvcSurfaceInput: Boolean,
     val encoderBitrateRangeBps: IntRange?, // best-effort
 
-    // ---- Policy outcomes ----
+    // ---- Policy outcomes (from hardware level + capabilities) ----
     val preferBufferMode: Boolean, // should skip Surface attempt for stability
+    val allowFpsGovernor: Boolean = true, // FULL/LEVEL_3 only; LIMITED/LEGACY use fixed cap
+    val allowDynamicBitrate: Boolean = true, // false on LEGACY
     val maxRecommendedBitrateBps: Int,
     val qualityLadder: List<StreamConfig>, // descending quality choices already mapped to supported sizes
 

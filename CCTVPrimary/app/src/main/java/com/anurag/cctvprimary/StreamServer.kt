@@ -6,7 +6,6 @@ import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 enum class RemoteCommand {
     START_RECORDING, STOP_RECORDING, BACKPRESSURE, PRESSURE_CLEAR, REQ_KEYFRAME, SWITCH_CAMERA, ZOOM, ADJUST_BITRATE
@@ -88,13 +87,9 @@ class StreamServer(
     private val frameQueue = LinkedBlockingQueue<EncodedFrame>(FRAME_QUEUE_CAPACITY)
     @Volatile private var senderRunning = false
 
-    // Thread management using Executors for proper lifecycle control
-    private val acceptExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Server-Accept").apply { isDaemon = true }
-    }
-    private val senderExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Server-Sender").apply { isDaemon = true }
-    }
+    // Use shared executors to avoid thread explosion (StreamingExecutors)
+    private val acceptExecutor: ExecutorService get() = StreamingExecutors.ioExecutor
+    private val senderExecutor: ExecutorService get() = StreamingExecutors.senderExecutor
 
     // ---- Synchronization lock ----
     private val configLock = Any()
@@ -202,13 +197,7 @@ class StreamServer(
             Log.e(logFrom, "[STREAM SERVER] Server stop failed")
         }
         serverSocket = null
-        // Shutdown executors gracefully
-        try {
-            acceptExecutor.shutdownNow()
-            senderExecutor.shutdownNow()
-        } catch (_: Exception) {
-            Log.w(logFrom, "[STREAM SERVER] Executor shutdown error (ignored)")
-        }
+        // Do not shut down acceptExecutor/senderExecutor — they are shared (StreamingExecutors)
     }
 
     /* ===============================
@@ -249,8 +238,9 @@ class StreamServer(
                             }
                             activeConfig?.let { cfg ->
                                 Log.d(logFrom, "[STREAM SERVER] 🔵 [KEYFRAME REQUEST] Sending STREAM_ACCEPTED to session: ${session.sessionId} (${cfg.width}x${cfg.height}@${cfg.fps})")
-                                session.sendControl(
-                                    "STREAM_ACCEPTED|epoch=$streamEpoch|width=${cfg.width}|height=${cfg.height}|bitrate=${cfg.bitrate}|fps=${cfg.fps}|session=${session.sessionId}"
+                                session.sendControlAtomic(
+                                    "STREAM_ACCEPTED|epoch=$streamEpoch|width=${cfg.width}|height=${cfg.height}|bitrate=${cfg.bitrate}|fps=${cfg.fps}|session=${session.sessionId}",
+                                    "STREAM_STATE|2|epoch=$streamEpoch"
                                 )
                                 session.enableStreaming(streamEpoch)
                             } ?: run {
@@ -328,8 +318,9 @@ class StreamServer(
                         val encoderH = encoderHeightProvider?.invoke() ?: 960
                         StreamConfig(encoderW, encoderH, 3_000_000, 30)
                     }
-                    s.sendControl(
-                        "STREAM_ACCEPTED|epoch=$streamEpoch|width=${cfg.width}|height=${cfg.height}|bitrate=${cfg.bitrate}|fps=${cfg.fps}|session=${s.sessionId}"
+                    s.sendControlAtomic(
+                        "STREAM_ACCEPTED|epoch=$streamEpoch|width=${cfg.width}|height=${cfg.height}|bitrate=${cfg.bitrate}|fps=${cfg.fps}|session=${s.sessionId}",
+                        "STREAM_STATE|2|epoch=$streamEpoch"
                     )
                     Log.i("STREAM SERVER", "[STREAM SERVER] Sending STREAM_ACCEPTED epoch=$streamEpoch")
                     s.enableStreaming(streamEpoch)
@@ -401,14 +392,13 @@ class StreamServer(
             it.width * it.height * it.bitrate
         }
 
-        // IMPORTANT:
+        // IMPORTANT — Epoch thrash mitigation:
         // We ultimately stream at the encoder's *actual* resolution, not necessarily the viewer-requested one.
-        // If we compare `activeConfig` to `winner` (requested), we can get into an epoch-thrash loop where:
-        // - activeConfig becomes "actual" (e.g. 720x960)
-        // - winner remains "requested" (e.g. 1080x1440)
-        // - resolveEncoderConfigLocked() is called again and thinks config changed -> bumps epoch again
-        //
-        // That exact loop matches the Viewer logs (epoch 1->2->3->4->5) and causes black screens.
+        // If we compared `activeConfig` to `winner` (requested), we could get an infinite epoch loop:
+        //   activeConfig gets set to "actual" (e.g. 720x960); winner stays "requested" (e.g. 1080x1440);
+        //   next resolveEncoderConfigLocked() sees activeConfig != winner -> bump epoch again; repeat.
+        // By comparing activeConfig to actualCfg (hardware-constrained: encoder dimensions + winner bitrate/fps),
+        // after one update we have activeConfig == actualCfg, so the next call does not bump. Loop broken.
         val actualWidth = encoderWidthProvider?.invoke() ?: winner.width
         val actualHeight = encoderHeightProvider?.invoke() ?: winner.height
         val actualCfg = StreamConfig(
@@ -418,6 +408,7 @@ class StreamServer(
             fps = winner.fps
         )
 
+        // Only bump epoch when current active differs from actual (avoids thrash: after this, activeConfig == actualCfg).
         if (activeConfig == null || activeConfig != actualCfg) {
             // New active configuration requires decoder reset on Viewer: bump epoch.
             streamEpoch += 1L
@@ -451,8 +442,9 @@ class StreamServer(
             sessions.forEach { session ->
                 resumeStates[session.sessionId] = ResumeState(activeConfig!!, now)
                 session.setStreamEpoch(streamEpoch)
-                session.sendControl(
-                    "STREAM_ACCEPTED|epoch=$streamEpoch|width=${actualWidth}|height=${actualHeight}|bitrate=${winner.bitrate}|fps=${winner.fps}|session=${session.sessionId}"
+                session.sendControlAtomic(
+                    "STREAM_ACCEPTED|epoch=$streamEpoch|width=${actualWidth}|height=${actualHeight}|bitrate=${winner.bitrate}|fps=${winner.fps}|session=${session.sessionId}",
+                    "STREAM_STATE|2|epoch=$streamEpoch"
                 )
                 Log.i(logFrom, "[STREAM SERVER] Sending STREAM_ACCEPTED epoch=$streamEpoch (resolve)")
                 session.enableStreaming(streamEpoch)
@@ -580,12 +572,16 @@ class StreamServer(
                 )
                 Log.d(logFrom, "[STREAM SERVER] 🔵 [RESOLUTION] Updated activeConfig from requested ${oldConfig.width}x${oldConfig.height} to actual encoder ${encoderWidth}x${encoderHeight}")
                 
-                // Broadcast updated STREAM_ACCEPTED to all active sessions
+                // Broadcast updated STREAM_ACCEPTED + RECONFIGURING atomically so viewer never sees reorder on some OEM kernels
                 val now = System.currentTimeMillis()
                 sessions.forEach { session ->
                     resumeStates[session.sessionId] = ResumeState(activeConfig!!, now)
                     session.setStreamEpoch(streamEpoch)
-                    session.sendControl("STREAM_ACCEPTED|epoch=$streamEpoch|width=${encoderWidth}|height=${encoderHeight}|bitrate=${activeConfig!!.bitrate}|fps=${activeConfig!!.fps}|session=${session.sessionId}")
+                    session.sendControlAtomic(
+                        "STREAM_ACCEPTED|epoch=$streamEpoch|width=${encoderWidth}|height=${encoderHeight}|bitrate=${activeConfig!!.bitrate}|fps=${activeConfig!!.fps}|session=${session.sessionId}",
+                        "STREAM_STATE|2|epoch=$streamEpoch"
+                    )
+                    session.enableStreaming(streamEpoch)
                     Log.d(logFrom, "[STREAM SERVER] 🔵 [RESOLUTION] Sent STREAM_ACCEPTED with actual encoder resolution: ${encoderWidth}x${encoderHeight}")
                 }
             } else {
@@ -623,6 +619,7 @@ class StreamServer(
     /**
      * Broadcast STREAM_STATE|STOPPED to all sessions so viewers can distinguish "stream intentionally ended" from "network lost".
      * Call when capture/encoder is stopped (e.g. stopCapture).
+     * IMPORTANT: Only ViewerSession emits STREAM_STATE to the wire; we must not send STREAM_STATE directly from StreamServer (single authority, no split-brain).
      */
     fun broadcastStreamStateStopped() {
         sessions.forEach { session ->

@@ -8,7 +8,7 @@ import android.util.Size
 
 internal object DeviceProfileManager {
     private const val TAG = "CCTV_DEVICE_PROFILE"
-    private const val VERSION = 3
+    private const val VERSION = 4
 
     /**
      * Builds (or loads) a DeviceProfile for the currently selected camera.
@@ -31,7 +31,10 @@ internal object DeviceProfileManager {
 
         val encCaps = CodecCapabilities.readAvcEncoderCaps()
         val cachedSurfaceBad = EncoderProbeStore.wasSurfaceInputMarkedBad(context)
-        val preferBuffer = DeviceQuirks.forceBufferInputMode() || !encCaps.hasSurfaceInput || cachedSurfaceBad
+        val preferBuffer = CameraHardwareLevelPolicy.preferBufferFromHardwareLevel(caps.hardwareLevel) ||
+            !encCaps.hasSurfaceInput || cachedSurfaceBad
+        val allowFpsGovernor = CameraHardwareLevelPolicy.allowFpsGovernor(caps.hardwareLevel)
+        val allowDynamicBitrate = CameraHardwareLevelPolicy.allowDynamicBitrate(caps.hardwareLevel)
 
         // Choose fixed FPS ceiling:
         // Prefer 30, then 24, then 15; else fall back to highest fixed.
@@ -94,6 +97,8 @@ internal object DeviceProfileManager {
             hasAvcSurfaceInput = encCaps.hasSurfaceInput,
             encoderBitrateRangeBps = encCaps.bitrateRangeBps,
             preferBufferMode = preferBuffer,
+            allowFpsGovernor = allowFpsGovernor,
+            allowDynamicBitrate = allowDynamicBitrate,
             maxRecommendedBitrateBps = maxRecommendedBitrate,
             qualityLadder = ladder,
             activeProbeSelectedConfig = null,

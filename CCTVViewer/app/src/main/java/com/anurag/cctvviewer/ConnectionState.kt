@@ -10,7 +10,9 @@ enum class ConnectionState {
     CONNECTING,
     CONNECTED,
     AUTHENTICATED,
+    RECOVERING,
     STREAMING,
-    RECOVERING
+    /** Stream intentionally stopped by server (STREAM_STATE|4). Pipeline inactive; distinct from CONNECTED (stream may start anytime). */
+    IDLE
 }
 
