@@ -72,6 +72,14 @@ class CameraForegroundService : LifecycleService() {
 
         // Encoder bitrate floor used throughout the app (keep consistent with existing clamps).
         private const val MIN_BITRATE_BPS = 300_000
+
+        /** Minimum ms between encoder recovery restarts (avoids crash on devices where encoder repeatedly stalls). */
+        private const val RECOVERY_COOLDOWN_MS = 90_000L
+        /** Stricter cooldown on low-tier hardware (LEGACY/LIMITED). */
+        private const val RECOVERY_COOLDOWN_LOW_TIER_MS = 180_000L
+        /** Encoder watchdog: if no keyframe for this long, post RecoverEncoder (same cooldown path). */
+        private const val ENCODER_WATCHDOG_KEYFRAME_TIMEOUT_MS = 45_000L
+        private const val ENCODER_WATCHDOG_CHECK_INTERVAL_MS = 30_000L
     }
 
     /* ---------------- CameraX ---------------- */
@@ -88,6 +96,11 @@ class CameraForegroundService : LifecycleService() {
     /* ---------- Encoder ---------- */
     private var videoEncoder: VideoEncoder? = null
 
+    /** Last time we performed an encoder recovery (stop+start). Used to throttle repeated recoveries. */
+    @Volatile private var lastEncoderRecoveryUptimeMs: Long = 0L
+    /** Last time a keyframe was produced (for encoder watchdog). */
+    @Volatile private var lastKeyframeUptimeMs: Long = 0L
+
     // Capability-driven profile (Camera2 + codec), persisted by firmware fingerprint.
     @Volatile private var deviceProfile: DeviceProfile? = null
     @Volatile private var activeProbeRunning: Boolean = false
@@ -96,6 +109,7 @@ class CameraForegroundService : LifecycleService() {
     private var customRecorder: CustomRecorder? = null
 
     /* ---------------- Streaming ---------------- */
+    private var commandBus: CommandBus? = null
     private var streamServer: StreamServer? = null
 
     /* ---------------- Audio Source Engine ---------------- */
@@ -526,6 +540,20 @@ class CameraForegroundService : LifecycleService() {
         }
     }
 
+    /** Encoder watchdog: if no keyframe for ENCODER_WATCHDOG_KEYFRAME_TIMEOUT_MS, post RecoverEncoder (same cooldown path as onRecoveryNeeded). */
+    private val encoderWatchdogRunnable = Runnable {
+        if (videoEncoder != null && lastKeyframeUptimeMs > 0L) {
+            val now = android.os.SystemClock.uptimeMillis()
+            if ((now - lastKeyframeUptimeMs) > ENCODER_WATCHDOG_KEYFRAME_TIMEOUT_MS) {
+                Log.w(logFrom, "Encoder watchdog: no keyframe for ${now - lastKeyframeUptimeMs}ms, posting RecoverEncoder")
+                commandBus?.post(StreamCommand.RecoverEncoder)
+            }
+        }
+        if (videoEncoder != null) {
+            rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS.toLong())
+        }
+    }
+
     private fun startBitrateRecoveryGovernor() {
         if (bitrateGovernorRunning) return
         if (deviceProfile?.allowDynamicBitrate == false) return
@@ -720,8 +748,18 @@ class CameraForegroundService : LifecycleService() {
     }
 
     /* ---------------- Lifecycle ---------------- */
+    // #region agent log
+    @Volatile private var debugRunId: String? = null
+    @Volatile private var lastHeartbeatLogUptimeMs: Long = 0L
+    // #endregion
+
     override fun onCreate() {
         super.onCreate()
+
+        // #region agent log
+        debugRunId = java.util.UUID.randomUUID().toString().take(8)
+        PrimaryDebugRunId.runId = debugRunId
+        // #endregion
 
         // Initialize AudioSourceEngine with context
         audioSourceEngine.setContext(this)
@@ -791,13 +829,16 @@ class CameraForegroundService : LifecycleService() {
         // Build/load capability-driven device profile early so initial capture uses validated sizes/fps.
         ensureDeviceProfile("service_create")
 
-        //Streaming
+        //Streaming: Command bus runs on control thread so no session/accept thread ever holds encoderLock.
+        commandBus = CommandBus(StreamingExecutors.controlExecutor) { cmd -> handleStreamCommand(cmd) }
+        commandBus!!.start()
+        val frameBus = FrameBus(StreamServer.FRAME_QUEUE_CAPACITY)
         streamServer = StreamServer(
             port = serverPort,
             passwordProvider = { accessPassword },
-            onRemoteCommand = { command, payload ->
-                onCommand(command, payload)
-            }).apply {
+            commandBus = commandBus!!,
+            frameBus = frameBus
+        ).apply {
             onSessionCountChanged = { count ->
                 activeViewerSessions = count
                 try {
@@ -806,15 +847,6 @@ class CameraForegroundService : LifecycleService() {
                 }
             }
             rotationProvider = { lastRotationDegrees }
-            onStreamConfigResolved = { cfg ->
-                Log.d(logFrom, "Resolved stream config: $cfg")
-                reconfigureEncoderIfNeeded(cfg)
-            }
-            onRequestKeyframe = {
-                synchronized(encoderLock) {
-                    videoEncoder?.requestSyncFrame()
-                }
-            }
             isRecordingProvider = { serviceState == ServiceCaptureState.RECORDING }
             cameraFacingProvider = { useFrontCamera }
             communicationEnabledProvider = { enableTalkback }
@@ -2837,6 +2869,11 @@ class CameraForegroundService : LifecycleService() {
     }
 
     /*Encoding*/ private fun startEncoder() {
+        // Reset cooldown so the first recovery in this session is allowed.
+        lastEncoderRecoveryUptimeMs = 0L
+        // #region agent log
+        DebugLog.log("primary", debugRunId, "D", "CameraForegroundService.startEncoder", "encoder_start", mapOf("event" to "encoder_start"))
+        // #endregion
         if (videoEncoder != null) return
 
         val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true) || forceBufferModeDueToCameraXCombo
@@ -2896,6 +2933,14 @@ class CameraForegroundService : LifecycleService() {
         videoEncoder?.setEncodedFrameListener(object : EncodedFrameListener {
             override fun onEncodedFrame(frame: EncodedFrame) {
                 try {
+                    // #region agent log
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (now - lastHeartbeatLogUptimeMs >= 30_000L) {
+                        lastHeartbeatLogUptimeMs = now
+                        DebugLog.log("primary", debugRunId, "D", "CameraForegroundService.onEncodedFrame", "heartbeat", mapOf("event" to "heartbeat", "activity" to "encoder_delivery"))
+                    }
+                    // #endregion
+                    if (frame.isKeyFrame) lastKeyframeUptimeMs = now
                     Log.d(
                         logFrom,
                         "🔵 [FRAME FLOW] frameListener.onEncodedFrame() called: size=${frame.data.size}, isKeyFrame=${frame.isKeyFrame}, streamServer=${streamServer != null}"
@@ -2909,21 +2954,10 @@ class CameraForegroundService : LifecycleService() {
             }
         })
         videoEncoder?.setOnRecoveryNeeded {
-            // Invoked from encoder drain thread; post to main and restart so pipeline cannot stall permanently.
-            rebindHandler.post {
-                if (videoEncoder != null) {
-                    Log.w(
-                        logFrom,
-                        "🔴 [ENCODER RECOVERY] Encoder requested recovery (stuck or keyframe drought). Restarting encoder."
-                    )
-                    val hadRecorder = customRecorder
-                    stopEncoder()
-                    startEncoder()
-                    if (hadRecorder != null) {
-                        videoEncoder?.setRecordingSink(hadRecorder)
-                    }
-                }
-            }
+            // #region agent log
+            DebugLog.log("primary", debugRunId, "D", "CameraForegroundService.setOnRecoveryNeeded", "encoder_recovery", mapOf("event" to "encoder_recovery_requested"))
+            // #endregion
+            rebindHandler.post { performEncoderRecoveryIfAllowed() }
         }
         Log.d(logFrom, "SetEncodedFrameListener initialized for sendFrame")
 
@@ -2947,9 +2981,42 @@ class CameraForegroundService : LifecycleService() {
         }
 
         videoEncoder?.requestSyncFrame()
+        lastKeyframeUptimeMs = android.os.SystemClock.uptimeMillis()
+        rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS.toLong())
+    }
+
+    /** Runs on rebindHandler. Performs encoder recovery (stop+start) if cooldown elapsed. Used by onRecoveryNeeded and by RecoverEncoder command (watchdog). */
+    private fun performEncoderRecoveryIfAllowed() {
+        val now = android.os.SystemClock.uptimeMillis()
+        val cooldownMs = if (deviceProfile?.allowFpsGovernor == false) RECOVERY_COOLDOWN_LOW_TIER_MS else RECOVERY_COOLDOWN_MS
+        if (lastEncoderRecoveryUptimeMs > 0L && (now - lastEncoderRecoveryUptimeMs) < cooldownMs) {
+            val remainingMs = cooldownMs - (now - lastEncoderRecoveryUptimeMs)
+            Log.w(
+                logFrom,
+                "Encoder recovery skipped – in cooldown (${remainingMs}ms remaining, allowFpsGovernor=${deviceProfile?.allowFpsGovernor})"
+            )
+            return
+        }
+        if (videoEncoder != null) {
+            lastEncoderRecoveryUptimeMs = now
+            Log.w(
+                logFrom,
+                "🔴 [ENCODER RECOVERY] Encoder recovery (stuck or keyframe drought). Restarting encoder (cooldown elapsed)."
+            )
+            val hadRecorder = customRecorder
+            stopEncoder()
+            startEncoder()
+            if (hadRecorder != null) {
+                videoEncoder?.setRecordingSink(hadRecorder)
+            }
+        }
     }
 
     private fun stopEncoder() {
+        rebindHandler.removeCallbacks(encoderWatchdogRunnable)
+        // #region agent log
+        DebugLog.log("primary", debugRunId, "C", "CameraForegroundService.stopEncoder", "encoder_stop", mapOf("event" to "encoder_stop"))
+        // #endregion
         stopBitrateRecoveryGovernor()
         videoEncoder?.stop()
         videoEncoder = null
@@ -2957,26 +3024,32 @@ class CameraForegroundService : LifecycleService() {
         Log.d(logFrom, "Video Encoder stopped")
     }
 
-    /* ---------------- Remote Commands ---------------- */
+    /* ---------------- Remote Commands (post to Command Bus; handler runs on control thread) ---------------- */
     fun onCommand(command: RemoteCommand, payload: Any? = null) {
-        when (command) {
-            RemoteCommand.START_RECORDING -> {
-                Log.d(logFrom, "Remote START_RECORDING")
-                startRecording(true)
-            }
+        commandBus?.post(remoteToStreamCommand(command, payload))
+    }
 
-            RemoteCommand.STOP_RECORDING -> {
-                Log.d(logFrom, "Remote STOP_RECORDING")
-                stopRecording()
-            }
-
-            RemoteCommand.REQ_KEYFRAME -> {
+    /** Invoked on the control thread by CommandBus. Never call from session/accept threads. */
+    private fun handleStreamCommand(cmd: StreamCommand) {
+        when (cmd) {
+            is StreamCommand.RequestKeyframe -> {
                 synchronized(encoderLock) {
                     videoEncoder?.requestSyncFrame()
                 }
             }
-
-            RemoteCommand.BACKPRESSURE -> {
+            is StreamCommand.StartRecording -> {
+                Log.d(logFrom, "Remote START_RECORDING")
+                startRecording(true)
+            }
+            is StreamCommand.StopRecording -> {
+                Log.d(logFrom, "Remote STOP_RECORDING")
+                stopRecording()
+            }
+            is StreamCommand.ReconfigureStream -> {
+                Log.d(logFrom, "Resolved stream config: ${cmd.config}")
+                reconfigureEncoderIfNeeded(cmd.config)
+            }
+            is StreamCommand.Backpressure -> {
                 // Track sustained backpressure as a proxy for network/receiver instability.
                 // This is intentionally simple and robust: we do NOT react to a single blip.
                 try {
@@ -3016,38 +3089,34 @@ class CameraForegroundService : LifecycleService() {
                     }
                 }
             }
-
-            RemoteCommand.ADJUST_BITRATE -> {
-                val newBitrate = payload as? Int
-                if (newBitrate != null && newBitrate > 0) {
+            is StreamCommand.PressureClear -> {
+                sustainedPressureCount = 0
+            }
+            is StreamCommand.AdjustBitrate -> {
+                val newBitrate = cmd.bitrate
+                if (newBitrate > 0) {
                     Log.d(logFrom, "Remote ADJUST_BITRATE: $newBitrate")
                     adjustBitrate(newBitrate)
                 }
             }
-
-            RemoteCommand.PRESSURE_CLEAR -> {
-                sustainedPressureCount = 0
-            }
-
-            RemoteCommand.SWITCH_CAMERA -> {
-                // Disallow switching while recording to avoid corrupting the file/stream.
+            is StreamCommand.SwitchCamera -> {
                 if (serviceState == ServiceCaptureState.RECORDING) {
                     Log.w(logFrom, "Ignoring SWITCH_CAMERA while recording")
                     return
                 }
                 Log.d(logFrom, "Remote SWITCH_CAMERA (primaryUiVisible=$primaryUiVisible)")
-                // Only include Preview if the Primary UI is visible (surface is expected to be valid).
-                // Otherwise bind headless to avoid freezes.
                 switchCamera(includePreview = primaryUiVisible)
             }
-
-            RemoteCommand.ZOOM -> {
-                val ratio = payload as? Float ?: 1.0f
+            is StreamCommand.Zoom -> {
+                val ratio = cmd.ratio
                 try {
                     Log.d(logFrom, "🟣 [FOVDBG][ZOOM_CMD] Received ZOOM command ratio=$ratio")
                 } catch (_: Throwable) {
                 }
                 setZoom(ratio)
+            }
+            is StreamCommand.RecoverEncoder -> {
+                rebindHandler.post { performEncoderRecoveryIfAllowed() }
             }
         }
     }/* ---Storage rotation ----------- */
@@ -3851,6 +3920,8 @@ class CameraForegroundService : LifecycleService() {
                     }
 
                     videoEncoder?.requestSyncFrame()
+                    lastKeyframeUptimeMs = android.os.SystemClock.uptimeMillis()
+                    rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS.toLong())
 
                     Log.d(
                         logFrom,

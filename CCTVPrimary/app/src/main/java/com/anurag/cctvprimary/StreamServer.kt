@@ -18,13 +18,12 @@ data class StreamConfig(
 class StreamServer(
     private val port: Int,
     private val passwordProvider: () -> String,
-    private val onRemoteCommand: (RemoteCommand, Any?) -> Unit,
-    var onStreamConfigResolved: ((StreamConfig) -> Unit)? = null,
-    var onRequestKeyframe: (() -> Unit)? = null,
+    private val commandBus: CommandBus,
+    private val frameBus: FrameBus,
     var onAudioFrameUp: ((ByteArray) -> Unit)? = null
 ) {
     companion object {
-        private const val FRAME_QUEUE_CAPACITY = 60
+        const val FRAME_QUEUE_CAPACITY = 60
         private const val SERVER_RESTART_BACKOFF_MS = 500L
         // Crash-hardening: protect low-end devices from reconnect storms.
         // When a Viewer is stuck reconnecting, sessions can accumulate briefly and stress the Primary.
@@ -84,7 +83,6 @@ class StreamServer(
     private var running = false
 
     private var serverSocket: ServerSocket? = null
-    private val frameQueue = LinkedBlockingQueue<EncodedFrame>(FRAME_QUEUE_CAPACITY)
     @Volatile private var senderRunning = false
 
     // Use shared executors to avoid thread explosion (StreamingExecutors)
@@ -180,7 +178,7 @@ class StreamServer(
         // Idempotent shutdown (callable even if accept loop already failed).
         running = false
         senderRunning = false
-        frameQueue.clear()
+        frameBus.clear()
         Log.d(logFrom, "[STREAM SERVER] Stopping StreamServer")
         sessions.forEach {
             // ViewerSession will self-close and callback
@@ -253,20 +251,17 @@ class StreamServer(
                                     session.sendEncoderRotation(rot)
                                 }
                             }
-                            Log.d(logFrom, "[STREAM SERVER] 🔵 [KEYFRAME REQUEST] Invoking onRequestKeyframe callback for session: ${session.sessionId}")
-                            onRequestKeyframe?.invoke() ?: run {
-                                Log.w(logFrom, "[STREAM SERVER] ⚠️ [KEYFRAME REQUEST] WARNING: onRequestKeyframe callback is NULL - keyframe may not be generated!")
-                            }
+                            Log.d(logFrom, "[STREAM SERVER] 🔵 [KEYFRAME REQUEST] Posting RequestKeyframe to command bus for session: ${session.sessionId}")
+                            commandBus.post(StreamCommand.RequestKeyframe)
                             Log.d(logFrom, "[STREAM SERVER] 🔵 [KEYFRAME REQUEST] REQ_KEYFRAME handling completed for session: ${session.sessionId}")
                         }
                         RemoteCommand.ADJUST_BITRATE -> {
-                            // Seamless bitrate adjustment without encoder reset
                             val newBitrate = payload as? Int
                             if (newBitrate != null && newBitrate > 0) {
-                                onRemoteCommand(cmd, newBitrate)
+                                commandBus.post(StreamCommand.AdjustBitrate(newBitrate))
                             }
                         }
-                        else -> onRemoteCommand(cmd, payload)
+                        else -> commandBus.post(remoteToStreamCommand(cmd, payload))
                     }
                 },
                 onAuthenticated = { s ->
@@ -332,7 +327,7 @@ class StreamServer(
                             s.sendEncoderRotation(rot)
                         }
                     }
-                    onRequestKeyframe?.invoke()
+                    commandBus.post(StreamCommand.RequestKeyframe)
                 },
                 onResumeRequested = { s, requestedId ->
                 handleResumeRequest(s, requestedId)
@@ -351,13 +346,17 @@ class StreamServer(
                 synchronized(configLock) {
                     requestedConfigs.remove(closed)
                     val removed = sessions.remove(closed)
+                    val activeAfter = sessions.size
                     resolveEncoderConfigLocked()
                     if (removed) {
                         try {
-                            onSessionCountChanged?.invoke(sessions.size)
+                            onSessionCountChanged?.invoke(activeAfter)
                         } catch (_: Throwable) {
                         }
                     }
+                    // #region agent log
+                    DebugLog.log("primary", PrimaryDebugRunId.runId, "C", "StreamServer.onSessionClosed", "session", mapOf("event" to "session_closed", "sessionId" to closed.sessionId, "activeSessionsAfter" to activeAfter))
+                    // #endregion
                 }
                 Log.d(logFrom, "[STREAM SERVER] Session removed; active sessions=${sessions.size}")
             },
@@ -378,7 +377,7 @@ class StreamServer(
                 lastCsd?.let { (sps, pps) -> session.sendCsd(sps, pps) }
                 isRecordingProvider?.let { session.sendRecordingState(it()) }
                 communicationEnabledProvider?.let { session.sendControl("COMM|enabled=${it()}") }
-                onRequestKeyframe?.invoke()
+                commandBus.post(StreamCommand.RequestKeyframe)
             } else {
                 session.sendControl("RESUME_FAIL")
             }
@@ -417,14 +416,8 @@ class StreamServer(
                 "[STREAM SERVER] 🔵 [EPOCH] Stream epoch incremented -> $streamEpoch (new config ${actualCfg.width}x${actualCfg.height} @ ${actualCfg.bitrate})"
             )
 
-            // Reconfigure encoder/camera to match the requested "quality intent".
-            // Encoder/camera code will clamp dimensions in Buffer Mode.
-            try {
-                onStreamConfigResolved?.invoke(winner)
-            } catch (t: Throwable) {
-                // Never let an encoder/camera reconfigure failure crash the TCP server thread.
-                Log.e(logFrom, "❌ [STREAM SERVER] onStreamConfigResolved threw (ignored)", t)
-            }
+            // Reconfigure encoder/camera to match the requested "quality intent" (via command bus).
+            commandBus.post(StreamCommand.ReconfigureStream(winner))
             Log.w(
                 logFrom,
                 "[STREAM SERVER] Encoder config arbitration result: " + "${winner.width}x${winner.height} @ ${winner.bitrate}"
@@ -457,18 +450,13 @@ class StreamServer(
             // - Some encoders output a few non-key frames before their next scheduled IDR.
             // - Viewers cannot reliably decode those frames on first connect (often shows as green preview).
             // - Requesting an IDR here makes startup deterministic and reduces time-to-first-frame.
-            try {
-                Log.d(logFrom, "🔵 [STREAM SERVER] Requesting immediate keyframe after STREAM_ACCEPTED broadcast (${actualWidth}x${actualHeight})")
-                onRequestKeyframe?.invoke()
-            } catch (t: Throwable) {
-                Log.w(logFrom, "⚠️ [STREAM SERVER] Failed to request immediate keyframe after STREAM_ACCEPTED (non-fatal)", t)
-            }
+            Log.d(logFrom, "🔵 [STREAM SERVER] Posting keyframe request after STREAM_ACCEPTED broadcast (${actualWidth}x${actualHeight})")
+            commandBus.post(StreamCommand.RequestKeyframe)
         }
     }
-    // 🔑 Called Externally
+    // 🔑 Called Externally (encoder pushes to FrameBus via this; sender loop drains from frameBus)
     fun enqueueFrame(frame: EncodedFrame) {
-        // Always log keyframes and first 20 frames for diagnostics
-        val queueSizeBefore = synchronized(this) { frameQueue.size }
+        val queueSizeBefore = frameBus.size()
         val sessionsCount = sessions.size
         val enqueueTimeMs = System.currentTimeMillis()
         val frameAgeMs = if (frame.captureEpochMs > 0) (enqueueTimeMs - frame.captureEpochMs).coerceAtLeast(0L) else -1L
@@ -505,32 +493,26 @@ class StreamServer(
             return
         }
 
-        val offered = synchronized(this) {
-            frameQueue.offer(frame)
-        }
-        val queueSizeAfter = synchronized(this) { frameQueue.size }
+        val offered = frameBus.publish(frame)
+        val queueSizeAfter = frameBus.size()
         if (!offered) {
-            // Prefer keyframes under pressure: dropping IDR causes visible artifacts until the next keyframe.
             if (frame.isKeyFrame) {
-                val cleared = synchronized(this) { frameQueue.size }.also {
-                    try {
-                        synchronized(this) {
-                            frameQueue.clear()
-                            frameQueue.offer(frame)
-                        }
-                    } catch (t: Throwable) {
-                        Log.w(logFrom, "⚠️ [STREAM SERVER] Failed to prioritize keyframe under overload (non-fatal)", t)
-                    }
+                val cleared = frameBus.size()
+                try {
+                    frameBus.clear()
+                    frameBus.publish(frame)
+                } catch (t: Throwable) {
+                    Log.w(logFrom, "⚠️ [STREAM SERVER] Failed to prioritize keyframe under overload (non-fatal)", t)
                 }
                 Log.w(
                     logFrom,
-                    "⚠️ [STREAM SERVER] Frame queue FULL - prioritized KEYFRAME by clearing $cleared stale frame(s): " +
-                        "size=${frame.data.size}, queueSizeAfter=${synchronized(this) { frameQueue.size }}, age=${frameAgeMs}ms"
+                    "⚠️ [STREAM SERVER] FrameBus FULL - prioritized KEYFRAME by clearing $cleared stale frame(s): " +
+                        "size=${frame.data.size}, queueSizeAfter=${frameBus.size()}, age=${frameAgeMs}ms"
                 )
             } else {
                 Log.w(
                     logFrom,
-                    "⚠️ [STREAM SERVER] Frame queue FULL (capacity=$FRAME_QUEUE_CAPACITY), dropping non-key frame: " +
+                    "⚠️ [STREAM SERVER] FrameBus FULL (capacity=$FRAME_QUEUE_CAPACITY), dropping non-key frame: " +
                         "size=${frame.data.size}, queueSizeBefore=$queueSizeBefore, queueSizeAfter=$queueSizeAfter, age=${frameAgeMs}ms"
                 )
             }
@@ -645,24 +627,21 @@ class StreamServer(
             var totalFramesSent = 0L
             try {
                 while (senderRunning) {
-                    // Low-latency fan-out: always broadcast the *latest* frame to sessions.
-                    // If the server sender falls behind, older frames build up here and cause viewer delay/jerks.
-                    val queueSizeBefore = synchronized(this@StreamServer) { frameQueue.size }
+                    val queueSizeBefore = frameBus.size()
                     val sessionsCount = sessions.size
-                    // Only log when queue is empty and we have sessions, or for keyframes
                     if (queueSizeBefore == 0 && sessionsCount > 0) {
-                        Log.d(logFrom, "🔵 [STREAM SERVER] Sender thread waiting for frame from queue (queueSize=0, sessions=$sessionsCount) - waiting for encoder to produce frames...")
+                        Log.d(logFrom, "🔵 [STREAM SERVER] Sender thread waiting for frame from FrameBus (queueSize=0, sessions=$sessionsCount) - waiting for encoder to produce frames...")
                     }
-                    var latest = frameQueue.take()
+                    var latest = frameBus.take()
                     var latestKey: EncodedFrame? = if (latest.isKeyFrame) latest else null
                     var framesDrained = 1
                     while (true) {
-                        val next = frameQueue.poll() ?: break
+                        val next = frameBus.poll() ?: break
                         latest = next
                         if (next.isKeyFrame) latestKey = next
                         framesDrained++
                     }
-                    val queueSizeAfter = synchronized(this@StreamServer) { frameQueue.size }
+                    val queueSizeAfter = frameBus.size()
                     // IMPORTANT: under load (e.g. motion), dropping keyframes causes visible "distortion" artifacts
                     // until the next keyframe arrives. Prefer sending the newest keyframe if one exists in this batch.
                     val toSend = latestKey ?: latest
@@ -698,7 +677,7 @@ class StreamServer(
                             val elapsedSeconds = (nowMs - lastPerformanceLogMs) / 1000.0
                             val framesSentDelta = totalFramesSent - lastFramesSent
                             val sendFps = if (elapsedSeconds > 0) framesSentDelta / elapsedSeconds else 0.0
-                            val currentQueueSize = synchronized(this@StreamServer) { frameQueue.size }
+                            val currentQueueSize = frameBus.size()
                             val activeSessions = sessions.size
                             
                             Log.i(

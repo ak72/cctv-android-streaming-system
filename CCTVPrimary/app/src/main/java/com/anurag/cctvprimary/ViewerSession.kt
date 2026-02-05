@@ -32,7 +32,11 @@ class ViewerSession(
         private const val HEARTBEAT_TIMEOUT_MS = 60_000L
         private const val SOCKET_BUFFER_SIZE_BYTES = 256 * 1024
         private const val FRAME_QUEUE_CAPACITY = 30
+        /** Per-session backpressure: if queue exceeds this (e.g. 2 keyframes worth), drop non-keyframes until next keyframe. Streaming favors freshness over completeness. */
+        private const val DROP_POLICY_QUEUE_THRESHOLD = 12
         private const val CONTROL_QUEUE_CAPACITY = 60
+        /** Socket read/write timeout (ms). Prevents a stuck reader or slow writer from holding the connection indefinitely. */
+        private const val SOCKET_TIMEOUT_MS = 20_000
         private const val HEARTBEAT_CHECK_INTERVAL_MS = 2_000L
 
         /** Protocol stream state codes (authoritative; viewer must obey). 1=ACTIVE, 2=RECONFIGURING, 3=PAUSED, 4=STOPPED */
@@ -183,7 +187,7 @@ class ViewerSession(
         Log.d(TAG, "[VIEWER SESSION] Session created for ${socket.inetAddress.hostAddress}")
         try {
             socket.tcpNoDelay = true
-            // Favor low-latency delivery; still TCP.
+            socket.soTimeout = SOCKET_TIMEOUT_MS
             try { socket.sendBufferSize = SOCKET_BUFFER_SIZE_BYTES } catch (_: Throwable) {}
             try { socket.receiveBufferSize = SOCKET_BUFFER_SIZE_BYTES } catch (_: Throwable) {}
         } catch (_: Throwable) { }
@@ -400,6 +404,10 @@ class ViewerSession(
             Log.w(TAG, "🔴 [VIEWER SESSION] enqueueFrame called but session is DISCONNECTED - dropping frame")
             return
         }
+        // Per-session drop policy: if this viewer's queue is already backed up, drop non-keyframes until next keyframe (favors freshness over completeness).
+        if (!frame.isKeyFrame && state == StreamState.STREAMING && frameQueue.size >= DROP_POLICY_QUEUE_THRESHOLD) {
+            return
+        }
         // Under load (e.g. motion), never silently drop keyframes; it causes visible decoder artifacts
         // until the next keyframe arrives.
         if (frame.isKeyFrame) {
@@ -582,6 +590,9 @@ class ViewerSession(
      * Cleanup
      * =============================== */
     fun close() {
+        // #region agent log
+        DebugLog.log("primary", PrimaryDebugRunId.runId, "C", "ViewerSession.close", "session", mapOf("event" to "session_close_start", "sessionId" to sessionId))
+        // #endregion
         if (!stateWrapper.compareAndSet(false, true)) return // Idempotent check
 
         Log.d(TAG, "[VIEWER SESSION] Closing session ${socket.inetAddress.hostAddress}")
