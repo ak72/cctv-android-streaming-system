@@ -2946,7 +2946,7 @@ class CameraForegroundService : LifecycleService() {
             height = encoderHeight,
             bitrate = currentBitrate,
             frameRate = currentFPS,
-            iFrameInterval = 1,
+            iFrameInterval = VideoEncoder.DEFAULT_I_FRAME_INTERVAL_SEC,
             context = this,
             forceBufferMode = forceBufferMode
         ) { _, _, _ ->
@@ -3952,7 +3952,7 @@ class CameraForegroundService : LifecycleService() {
                         height = encoderHeight,
                         bitrate = currentBitrate,
                         frameRate = currentFPS,
-                        iFrameInterval = 1,
+                        iFrameInterval = VideoEncoder.DEFAULT_I_FRAME_INTERVAL_SEC,
                         context = this,
                         forceBufferMode = forceBufferMode
                     ) { _, _, _ -> }

@@ -37,11 +37,17 @@ object MediaCodecConfig {
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
             // Use VBR for better compatibility (CBR is often unsupported or flaky on Android)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            // CRITICAL: Explicitly set Baseline Profile for Exynos compatibility
+            // CRITICAL: Baseline profile for Exynos compatibility and low-latency streaming (no B-frames).
             // Exynos devices accept High Profile during configuration but fail to encode actual pixel data,
-            // producing "empty" frames (8-11 bytes). Baseline Profile guarantees valid frame output.
+            // producing "empty" frames (8-11 bytes). Baseline guarantees valid output and no B-frames.
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            // Optional low-latency hint (vendor-specific; may have no effect on many devices)
+            try {
+                val key = MediaFormat::class.java.getDeclaredField("KEY_LATENCY")
+                key.isAccessible = true
+                (key.get(null) as? String)?.let { setInteger(it, 0) }
+            } catch (_: Throwable) { /* KEY_LATENCY not in this SDK */ }
         }
     }
     

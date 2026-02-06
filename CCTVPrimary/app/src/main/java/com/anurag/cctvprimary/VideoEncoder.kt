@@ -52,7 +52,7 @@ class VideoEncoder(
     private val height: Int,
     private val bitrate: Int,
     private val frameRate: Int,
-    private val iFrameInterval: Int, // I-frame interval in seconds. Used in ByteBuffer mode; temporarily hardcoded to 0 (All-Intra) in Surface mode
+    private val iFrameInterval: Int, // I-frame interval in seconds (GOP). Used in both Surface and ByteBuffer modes.
     @Suppress("UNUSED_PARAMETER") private val context: Context, // Reserved for future device-specific features
     private val forceBufferMode: Boolean = false,
     @Suppress("UNUSED_PARAMETER") private val onEncodedFrame: (
@@ -187,6 +187,9 @@ class VideoEncoder(
     }
 
     companion object {
+        /** Default I-frame interval in seconds (GOP). 2s is a good balance for mobile CPU/battery vs. seek and recovery. */
+        const val DEFAULT_I_FRAME_INTERVAL_SEC = 2
+
         /**
          * Centralized decision: whether to prefer ByteBuffer input mode (skip Surface attempt).
          *
@@ -247,7 +250,7 @@ class VideoEncoder(
      */
     private fun createFormatForStrategy(
         strategy: ConfigStrategy, bitrate: Int, frameRate: Int,
-        @Suppress("UNUSED_PARAMETER") iFrameInterval: Int // Used in ByteBuffer mode; temporarily hardcoded to 0 (All-Intra) in Surface mode
+        iFrameInterval: Int
     ): MediaFormat {
         val format = MediaFormat.createVideoFormat(
             MediaFormat.MIMETYPE_VIDEO_AVC, strategy.width, strategy.height
@@ -260,13 +263,7 @@ class VideoEncoder(
 
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-
-            // DIAGNOSTIC: Force All-Intra (Keyframe-only) mode to verify video pipeline
-            // Setting I_FRAME_INTERVAL to 0 requests a keyframe for *every* frame
-            // This eliminates P-frame issues (empty/corrupted frames) to prove frames are reaching the encoder
-            // TODO: Revert to iFrameInterval parameter after verifying pipeline works
-            // NOTE: iFrameInterval IS used in ByteBuffer mode (see startByteBufferMode() -> MediaCodecConfig.createVideoFormat())
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
 
             // CRITICAL: Use VBR instead of CBR for Exynos compatibility
             // Exynos chips (Samsung M30s, etc.) notoriously fail or stall with CBR mode
@@ -276,6 +273,12 @@ class VideoEncoder(
             )
             setInteger(MediaFormat.KEY_PROFILE, strategy.profile)
             setInteger(MediaFormat.KEY_LEVEL, strategy.level)
+            // Optional low-latency hint (vendor-specific; may have no effect on many devices)
+            try {
+                val key = MediaFormat::class.java.getDeclaredField("KEY_LATENCY")
+                key.isAccessible = true
+                (key.get(null) as? String)?.let { setInteger(it, 0) }
+            } catch (_: Throwable) { /* KEY_LATENCY not in this SDK */ }
         }
         return format
     }
@@ -405,7 +408,7 @@ class VideoEncoder(
                 val configuredIFrameInterval = format.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL)
                 Log.d(
                     TAG,
-                    "Encoder configured successfully: ${strategy.description}, iFrameInterval=$configuredIFrameInterval (${if (configuredIFrameInterval == 0) "All-Intra Mode ✅" else "Normal Mode"})"
+                    "Encoder configured successfully: ${strategy.description}, GOP=${configuredIFrameInterval}s"
                 )
                 configured = true
                 successfulStrategy = strategy
@@ -528,7 +531,7 @@ class VideoEncoder(
         val configuredIFrameInterval = format.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL)
         Log.d(
             TAG,
-            "🔍 [PROFILE CHECK] MediaFormat profile=$configuredProfile (${if (configuredProfile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) "Baseline ✅" else "NOT Baseline ⚠️"}), level=$configuredLevel, iFrameInterval=$configuredIFrameInterval (${if (configuredIFrameInterval == 0) "All-Intra Mode ✅" else "Normal Mode"})"
+            "🔍 [PROFILE CHECK] MediaFormat profile=$configuredProfile (${if (configuredProfile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) "Baseline" else "NOT Baseline"}), level=$configuredLevel, GOP=${configuredIFrameInterval}s"
         )
 
         mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
