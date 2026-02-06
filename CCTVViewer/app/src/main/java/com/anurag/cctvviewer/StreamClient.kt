@@ -49,6 +49,10 @@ class StreamClient(
     @Volatile
     private var appInBackground = false
 
+    // #region agent log
+    @Volatile private var debugRunId: String? = null
+    // #endregion
+
     /* ===============================
        * Connection state
        * =============================== */
@@ -178,6 +182,8 @@ class StreamClient(
     @Volatile private var lastStreamStateFromServerUptimeMs: Long = 0L
     /** When true, handshake/watchdog may downgrade UI (e.g. AUTHENTICATED→CONNECTED, STREAMING→RECOVERING). When server sends STREAM_STATE we never infer from decoder. */
     private fun canInferState(): Boolean = !serverSupportsStreamState
+    /** After background/foreground we can get stuck in RECOVERING (video plays but ACTIVE never arrives). First frame rendered while RECOVERING upgrades label to STREAMING once. */
+    @Volatile private var recoveringUpgradeToStreamingPending: Boolean = false
 
     // --- Handshake / startup tracking ---
     // The Viewer can get stuck in AUTHENTICATED ("Starting stream…") if the negotiation messages
@@ -379,6 +385,14 @@ class StreamClient(
     // --- Decoder recovery / overload protection ---
     // Count of frames dropped at receive-time due to decode queue overload.
     @Volatile private var rxOverloadDropCount: Long = 0L
+    /** Frames dropped because epoch did not match current stream epoch (reconfig/race). */
+    private val framesDroppedEpochCount = java.util.concurrent.atomic.AtomicLong(0L)
+    /** Number of decoder reset/reconfig events (for disconnect summary). */
+    private val reconfigCount = java.util.concurrent.atomic.AtomicLong(0L)
+    /** Number of recovery disconnects (disconnectForRecovery). */
+    private val recoveryCount = java.util.concurrent.atomic.AtomicLong(0L)
+    /** Epoch for which the current decoder was configured; used to log and gate decode path. */
+    @Volatile private var decoderEpoch: Long = -1L
 
     /* Profile selection (adaptive based on device hints) */
     // For "try high first, then fall back": once we detect this device can't keep up at a given profile,
@@ -581,7 +595,11 @@ class StreamClient(
                 }
             }
         }
-        
+
+        // #region agent log
+        if (debugRunId == null) debugRunId = java.util.UUID.randomUUID().toString().take(8)
+        DebugLog.log("viewer", debugRunId, "A", "StreamClient.connect", "connect_start", mapOf("event" to "connect_start", "host" to (host.take(20))))
+        // #endregion
         postState(ConnectionState.CONNECTING)
 
         connectExecutor.execute {
@@ -619,6 +637,9 @@ class StreamClient(
                 startAudioPlayback()
 
                 send("HELLO|client=viewer|version=2")
+                // #region agent log
+                DebugLog.log("viewer", debugRunId, "A", "StreamClient.connect", "connect_success", mapOf("event" to "connect_success"))
+                // #endregion
                 // AUTH is now handled via CHAP (wait for AUTH_CHALLENGE)
 
 
@@ -648,6 +669,7 @@ class StreamClient(
         // Note: Do NOT shutdown executors here - they may be needed for reconnection.
         // Executors are only shut down in shutdown() which is called on app disposal.
 
+        logDisconnectSummary("disconnect")
         postState(ConnectionState.DISCONNECTED)
     }
 
@@ -659,6 +681,7 @@ class StreamClient(
      * - Used by watchdogs and IO failures to force a clean reconnect.
      */
     private fun disconnectForRecovery(reason: String) {
+        recoveryCount.incrementAndGet()
         try {
             Log.w(logFrom, "[Stream Client] 🔴 [RECOVERY] disconnectForRecovery(reason=$reason, autoReconnect=$autoReconnect)")
             try { setPreviewVisible(false) } catch (_: Throwable) {}
@@ -668,6 +691,7 @@ class StreamClient(
             releaseAudioTrack()
             closeSocket()
             resetAdaptiveJitterState("recover:$reason")
+            logDisconnectSummary("recovery")
             postState(ConnectionState.DISCONNECTED)
         } finally {
             if (autoReconnect) {
@@ -676,7 +700,23 @@ class StreamClient(
         }
     }
 
+    /** One-time disconnect summary for diagnostics (session duration, drops, reconfigs, recoveries). */
+    private fun logDisconnectSummary(source: String) {
+        val durationMs = if (connectedUptimeMs > 0L) android.os.SystemClock.uptimeMillis() - connectedUptimeMs else 0L
+        val epochDrops = framesDroppedEpochCount.get()
+        val queueDrops = rxOverloadDropCount
+        val reconfigs = reconfigCount.get()
+        val recoveries = recoveryCount.get()
+        Log.i(
+            logFrom,
+            "[Stream Client] 📊 Disconnect summary (source=$source): durationMs=$durationMs, lastState=$currentState, framesDroppedEpoch=$epochDrops, framesDroppedQueue=$queueDrops, reconfigs=$reconfigs, recoveries=$recoveries"
+        )
+    }
+
     fun onAppBackgrounded() {
+        // #region agent log
+        DebugLog.log("viewer", debugRunId, "A", "StreamClient.onAppBackgrounded", "lifecycle", mapOf("event" to "lifecycle_background"))
+        // #endregion
         if (appInBackground) return
         appInBackground = true
         Log.d(logFrom, "[Stream Client] 🟡 [VIEWER] App backgrounded – closing socket")
@@ -686,6 +726,9 @@ class StreamClient(
     }
 
     fun onAppForegrounded() {
+        // #region agent log
+        DebugLog.log("viewer", debugRunId, "A", "StreamClient.onAppForegrounded", "lifecycle", mapOf("event" to "lifecycle_foreground"))
+        // #endregion
         if (!appInBackground) return
         appInBackground = false
         Log.d(logFrom, "[Stream Client] 🟢 [VIEWER] App foregrounded – reconnecting")
@@ -933,6 +976,9 @@ class StreamClient(
                             val nowUptime = android.os.SystemClock.uptimeMillis()
                             lastStreamStateFromServerUptimeMs = nowUptime
                             if (msgEpoch != null && msgEpoch > 0L) streamEpoch = msgEpoch
+                            // #region agent log
+                            DebugLog.log("viewer", debugRunId, "B", "StreamClient.listen", "stream_state_rx", mapOf("event" to "stream_state_rx", "code" to code, "epoch" to (msgEpoch ?: 0L)))
+                            // #endregion
                             when (code) {
                             1 -> {
                                 Log.d(logFrom, "[Stream Client] STREAM_STATE ACTIVE (epoch=$msgEpoch) — posting STREAMING")
@@ -1230,8 +1276,13 @@ class StreamClient(
                         val srvMs = params["srvMs"]?.toLongOrNull() ?: -1L
                         val capMs = params["capMs"]?.toLongOrNull() ?: -1L
                         val ageMs = params["ageMs"]?.toLongOrNull() ?: -1L
-                        // Hard gate: drop any frame whose epoch does not match current. Prevents decoder configured for one config (e.g. 720p) from receiving data from another (e.g. 1080p) after recording restart / camera rebind / resolution change. No log — just drop.
+                        // Hard gate: drop any frame whose epoch does not match current. Prevents decoder configured for one config (e.g. 720p) from receiving data from another (e.g. 1080p) after recording restart / camera rebind / resolution change.
                         if (streamEpoch > 0L && msgEpoch > 0L && msgEpoch != streamEpoch) {
+                            framesDroppedEpochCount.incrementAndGet()
+                            val n = framesDroppedEpochCount.get()
+                            if (n <= 3 || n % 50L == 0L) {
+                                Log.d(logFrom, "[Stream Client] 🔵 [EPOCH DROP] Dropped frame epoch=$msgEpoch (current=$streamEpoch) totalEpochDrops=$n")
+                            }
                             if (size > 0) {
                                 val sink = ByteArrayPool.get(size)
                                 readFullyFromSocket(sink)
@@ -1669,6 +1720,7 @@ class StreamClient(
         } finally {
             stopHeartbeat()
             closeSocket()
+            logDisconnectSummary("socket_close")
             // IMPORTANT: Always reflect socket closure in UI immediately.
             // If autoReconnect is enabled, connect() will move state to CONNECTING shortly after.
             postState(ConnectionState.DISCONNECTED)
@@ -2598,6 +2650,18 @@ class StreamClient(
                             // Decoder events are telemetry only; connection state comes only from STREAM_STATE (no inference).
                             if (currentState == ConnectionState.RECOVERING) {
                                 Log.d(logFrom, "[Stream Client] 📊 [TELEMETRY] Frame rendered while RECOVERING (state from STREAM_STATE only)")
+                                // After background/foreground we can get stuck in RECOVERING (video plays but ACTIVE never arrives). Upgrade label to STREAMING once so UI matches reality.
+                                if (recoveringUpgradeToStreamingPending) {
+                                    recoveringUpgradeToStreamingPending = false
+                                    Log.d(logFrom, "[Stream Client] 🔵 [RESUME] First frame rendered while RECOVERING — upgrading label to STREAMING")
+                                    postState(ConnectionState.STREAMING)
+                                }
+                            }
+                            // After resume we can be stuck in CONNECTING (listen thread ahead of main thread or message reorder). Video is already playing so upgrade so buttons enable.
+                            if (currentState == ConnectionState.CONNECTING) {
+                                Log.d(logFrom, "[Stream Client] 🔵 [RESUME] Frame rendered while CONNECTING — upgrading to RECOVERING so UI/buttons match")
+                                recoveringUpgradeToStreamingPending = true
+                                postState(ConnectionState.RECOVERING)
                             }
 
                             if (!postedFirstFrameRendered) {
@@ -2611,6 +2675,9 @@ class StreamClient(
                                     }
                                     if (nordCe4RenderedFramesAfterWarmup >= 5) {
                                         postedFirstFrameRendered = true
+                                        // #region agent log
+                                        DebugLog.log("viewer", debugRunId, "B", "StreamClient.decodeLoop", "first_frame_rendered", mapOf("event" to "first_frame_rendered", "currentState" to currentState.name))
+                                        // #endregion
                                         Log.d(
                                             logFrom,
                                             "🔵 [DECODER] Nord CE4: stable frames reached ($nordCe4RenderedFramesAfterWarmup) -> invoking onFirstFrameRendered"
@@ -2635,6 +2702,9 @@ class StreamClient(
                                             if (firstRenderAttemptUptimeMs > 0L) (nowUptimeMs - firstRenderAttemptUptimeMs) else 0L
                                         if (warmupCleared && renderAttemptAgeMs >= 2_000L) {
                                             postedFirstFrameRendered = true
+                                            // #region agent log
+                                            DebugLog.log("viewer", debugRunId, "B", "StreamClient.decodeLoop", "first_frame_rendered", mapOf("event" to "first_frame_rendered", "currentState" to currentState.name))
+                                            // #endregion
                                             Log.w(
                                                 logFrom,
                                                 "⚠️ [NORD_CE4] Fallback reveal: forcing first-frame rendered after ${renderAttemptAgeMs}ms of render attempts (stableFrames=$nordCe4RenderedFramesAfterWarmup)"
@@ -2663,6 +2733,9 @@ class StreamClient(
                                     }
                                 } else {
                                     postedFirstFrameRendered = true
+                                    // #region agent log
+                                    DebugLog.log("viewer", debugRunId, "B", "StreamClient.decodeLoop", "first_frame_rendered", mapOf("event" to "first_frame_rendered", "currentState" to currentState.name))
+                                    // #endregion
                                     Log.d(
                                         logFrom,
                                         "🔵 [DECODER] First frame rendered! Invoking onFirstFrameRendered callback"
@@ -2922,11 +2995,14 @@ class StreamClient(
             }
             
             try {
+                val createEpoch = streamEpoch
+                Log.i(logFrom, "[Stream Client] 🔵 [DECODER CREATE] Creating decoder epoch=$createEpoch reason=startDecoderIfReady dims=${decoderWidth}x${decoderHeight}")
                 decoder = MediaCodec.createDecoderByType("video/avc").apply {
                     // CRITICAL: Configure decoder with Surface for hardware-accelerated rendering
                     configure(
                         format, surface, null, 0
                     )
+                decoderEpoch = createEpoch
 
                     // Track configured dimensions for later mismatch detection.
                     // This is used by STREAM_ACCEPTED to decide whether we must force a reset/restart.
@@ -2986,9 +3062,10 @@ class StreamClient(
 
     private fun resetDecoderInternal() {
         synchronized(decoderLock) {
-            // CRITICAL FIX: Log decoder reset to help diagnose race conditions
             val decoderExists = decoder != null
-            Log.d(logFrom, "[Stream Client] 🔵 [DECODER RESET] resetDecoderInternal() called - decoder exists: $decoderExists, thread: ${Thread.currentThread().name}")
+            val resetEpoch = decoderEpoch
+            if (decoderExists) reconfigCount.incrementAndGet()
+            Log.i(logFrom, "[Stream Client] 🔵 [DECODER RESET] resetDecoderInternal() epoch=$resetEpoch decoderExists=$decoderExists thread=${Thread.currentThread().name}")
             try {
                 if (decoderExists) {
                     Log.d(logFrom, "[Stream Client] 🔵 [DECODER RESET] Stopping and releasing decoder")
@@ -3002,6 +3079,7 @@ class StreamClient(
                     Log.d(logFrom, "[Stream Client] 🔵 [DECODER RESET] Decoder set to null")
                 }
                 decoder = null
+                decoderEpoch = -1L
                 waitingForKeyframe = true
                 droppedNonKeyWhileWaitingCount = 0
                 lastDropNonKeyWhileWaitingLogMs = 0L
@@ -4074,8 +4152,12 @@ class StreamClient(
     }
 
     private fun postState(state: ConnectionState) {
+        // #region agent log
+        val prev = currentState
+        DebugLog.log("viewer", debugRunId, "A", "StreamClient.postState", "postState", mapOf("event" to "postState", "newState" to state.name, "previousState" to prev.name))
+        // #endregion
         Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] postState() called: $state (from ${Thread.currentThread().name}), currentState=$currentState")
-        
+
         // Prevent state downgrades: don't allow AUTHENTICATED to overwrite STREAMING or RECOVERING
         // State hierarchy: DISCONNECTED < CONNECTING < AUTHENTICATED < RECOVERING < STREAMING
         if (state == ConnectionState.AUTHENTICATED && currentState == ConnectionState.STREAMING) {
@@ -4089,6 +4171,8 @@ class StreamClient(
         
         // Update current state IMMEDIATELY to prevent queued callbacks from overwriting
         currentState = state
+        if (state == ConnectionState.RECOVERING) recoveringUpgradeToStreamingPending = true
+        if (state == ConnectionState.STREAMING) recoveringUpgradeToStreamingPending = false
         
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Log.d(logFrom, "[Stream Client] 🔍 [CSD DIAGNOSTIC] Calling onStateChanged on main thread: $state")

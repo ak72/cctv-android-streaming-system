@@ -541,7 +541,7 @@ class CameraForegroundService : LifecycleService() {
     }
 
     /** Encoder watchdog: if no keyframe for ENCODER_WATCHDOG_KEYFRAME_TIMEOUT_MS, post RecoverEncoder (same cooldown path as onRecoveryNeeded). */
-    private val encoderWatchdogRunnable = Runnable {
+    private val encoderWatchdogRunnable: Runnable = Runnable {
         if (videoEncoder != null && lastKeyframeUptimeMs > 0L) {
             val now = android.os.SystemClock.uptimeMillis()
             if ((now - lastKeyframeUptimeMs) > ENCODER_WATCHDOG_KEYFRAME_TIMEOUT_MS) {
@@ -550,7 +550,7 @@ class CameraForegroundService : LifecycleService() {
             }
         }
         if (videoEncoder != null) {
-            rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS.toLong())
+            rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS)
         }
     }
 
@@ -614,7 +614,8 @@ class CameraForegroundService : LifecycleService() {
     private val analysisExecutor: java.util.concurrent.ExecutorService get() = StreamingExecutors.encodingExecutor
 
     // CRITICAL: stopRecording() can block (draining codecs + muxer.stop), so never run it on UI thread.
-    private val recordingControlExecutor: java.util.concurrent.ExecutorService get() = StreamingExecutors.controlExecutor
+    // Must not be controlExecutor: CommandBus runs an infinite loop there and never yields to the executor queue.
+    private val recordingControlExecutor: java.util.concurrent.ExecutorService get() = StreamingExecutors.recordingExecutor
 
     @Volatile
     private var stopRecordingInProgress: Boolean =
@@ -759,6 +760,15 @@ class CameraForegroundService : LifecycleService() {
         // #region agent log
         debugRunId = java.util.UUID.randomUUID().toString().take(8)
         PrimaryDebugRunId.runId = debugRunId
+        try {
+            val logFile = (getExternalFilesDir(null) ?: filesDir)?.let { File(it, "debug_ndjson.log") }
+            DebugLog.installFileSink(logFile)
+            DebugLog.log("primary", debugRunId, "A", "CameraForegroundService.onCreate", "device_quirk", mapOf(
+                "manufacturer" to (Build.MANUFACTURER ?: ""),
+                "model" to (Build.MODEL ?: ""),
+                "deviceQuirkForceBuffer" to DeviceQuirks.forceBufferInputMode()
+            ))
+        } catch (_: Throwable) { }
         // #endregion
 
         // Initialize AudioSourceEngine with context
@@ -855,8 +865,9 @@ class CameraForegroundService : LifecycleService() {
             }
             // CRITICAL: Set encoder resolution providers so StreamServer uses actual encoder dimensions
             // This ensures Buffer Mode (960x720) overrides requested resolution (1080x1440)
+            val forceBufForProviders = AppSettings.isForceBufferMode(this@CameraForegroundService) || (deviceProfile?.preferBufferMode == true) || DeviceQuirks.forceBufferInputMode()
             encoderWidthProvider = {
-                if (VideoEncoder.shouldPreferBufferMode(this@CameraForegroundService, AppSettings.isForceBufferMode(this@CameraForegroundService))) {
+                if (VideoEncoder.shouldPreferBufferMode(this@CameraForegroundService, forceBufForProviders)) {
                     // Buffer Mode resolution (respect orientation)
                     if (currentWidth < currentHeight) 720 else 960
                 } else {
@@ -866,7 +877,7 @@ class CameraForegroundService : LifecycleService() {
                 }
             }
             encoderHeightProvider = {
-                if (VideoEncoder.shouldPreferBufferMode(this@CameraForegroundService, AppSettings.isForceBufferMode(this@CameraForegroundService))) {
+                if (VideoEncoder.shouldPreferBufferMode(this@CameraForegroundService, forceBufForProviders)) {
                     // Buffer Mode resolution (respect orientation)
                     if (currentWidth < currentHeight) 960 else 720
                 } else {
@@ -1690,8 +1701,10 @@ class CameraForegroundService : LifecycleService() {
      * - Never run this on the UI thread (risk ANR).
      */
     fun startRecording(withAudio: Boolean) {
+        Log.d("CCTV_PRIMARY", "[PRIMARY CFS] startRecording(withAudio=$withAudio) received - posting to recording executor")
         recordingControlExecutor.execute {
             try {
+                Log.d("CCTV_PRIMARY", "[PRIMARY CFS] startRecording executor running - calling startRecordingInternal")
                 startRecordingInternal(withAudio)
             } catch (t: Throwable) {
                 Log.e(logFrom, "startRecording async failed", t)
@@ -1864,6 +1877,7 @@ class CameraForegroundService : LifecycleService() {
                 // val cursor = contentResolver.query(uri, arrayOf(MediaStore.Video.Media.DATA), null, null)
             } else {
                 Log.e(logFrom, "Failed to create MediaStore entry")
+                recordingRequested = false
                 return
             }
         } else {
@@ -1885,6 +1899,7 @@ class CameraForegroundService : LifecycleService() {
                     logFrom,
                     "🔴 [RECORDING] CRITICAL: Failed to open FileDescriptor from URI: $finalUri"
                 )
+                recordingRequested = false
                 return
             }
             Log.d(
@@ -1896,6 +1911,7 @@ class CameraForegroundService : LifecycleService() {
                 "🔴 [RECORDING] CRITICAL: Exception opening FileDescriptor from URI: $finalUri",
                 e
             )
+            recordingRequested = false
             return
         }
 
@@ -1907,7 +1923,7 @@ class CameraForegroundService : LifecycleService() {
             // 1. Try Surface Mode first (higher resolution, better quality) if device supports it
             // 2. Fall back to Buffer Mode only if device requires it (problematic devices)
             // 3. For Buffer Mode, use higher resolution if possible (check ImageAnalysis capabilities)
-            val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true)
+            val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true) || DeviceQuirks.forceBufferInputMode()
             val isBufferMode = VideoEncoder.shouldPreferBufferMode(this, forceBufferMode)
 
             val recordingWidth: Int
@@ -2678,10 +2694,10 @@ class CameraForegroundService : LifecycleService() {
             // Lower gate slightly; we still suppress very low-level hiss.
             if (rms < 120.0) return
 
-            // Adaptive gain:
+            // Adaptive gain (rms >= 120.0 here due to gate above):
             // Target a moderate speech RMS; clamp to avoid distortion.
             val desiredRms = 2800.0
-            val gain = if (rms <= 1.0) 1.0 else (desiredRms / rms).coerceIn(1.0, 4.0)
+            val gain = (desiredRms / rms).coerceIn(1.0, 4.0)
 
             // Soft limiter to avoid harsh clipping when applying large gain.
             // Formula: y = x / (1 + |x|/limit). This is cheap and stable.
@@ -2876,7 +2892,16 @@ class CameraForegroundService : LifecycleService() {
         // #endregion
         if (videoEncoder != null) return
 
-        val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true) || forceBufferModeDueToCameraXCombo
+        val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true) || forceBufferModeDueToCameraXCombo || DeviceQuirks.forceBufferInputMode()
+        // #region agent log
+        DebugLog.log("primary", debugRunId, "A", "CameraForegroundService.startEncoder", "encoder_force_buffer", mapOf(
+            "forceBufferMode" to forceBufferMode,
+            "appSettings" to AppSettings.isForceBufferMode(this),
+            "profilePrefer" to (deviceProfile?.preferBufferMode == true),
+            "cameraXCombo" to forceBufferModeDueToCameraXCombo,
+            "deviceQuirk" to DeviceQuirks.forceBufferInputMode()
+        ))
+        // #endregion
 
         // Detect if Buffer Mode will be active (manual override or problematic device)
         val willUseBufferMode = VideoEncoder.shouldPreferBufferMode(this, forceBufferMode)
@@ -2966,6 +2991,14 @@ class CameraForegroundService : LifecycleService() {
             videoEncoder?.useSurfaceInput?.let { if (it) "Surface input mode" else "ByteBuffer input mode" }
                 ?: "Unknown"
         }
+        // #region agent log
+        DebugLog.log("primary", debugRunId, "A", "CameraForegroundService.startEncoder", "encoder_started_actual_mode", mapOf(
+            "useSurfaceInput" to (synchronized(encoderLock) { videoEncoder?.useSurfaceInput }),
+            "encoderMode" to encoderMode,
+            "w" to encoderWidth,
+            "h" to encoderHeight
+        ))
+        // #endregion
         Log.d(
             logFrom, "Video encoder started ($encoderMode, ${encoderWidth}x${encoderHeight})"
         )
@@ -2982,11 +3015,14 @@ class CameraForegroundService : LifecycleService() {
 
         videoEncoder?.requestSyncFrame()
         lastKeyframeUptimeMs = android.os.SystemClock.uptimeMillis()
-        rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS.toLong())
+        rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS)
     }
 
     /** Runs on rebindHandler. Performs encoder recovery (stop+start) if cooldown elapsed. Used by onRecoveryNeeded and by RecoverEncoder command (watchdog). */
     private fun performEncoderRecoveryIfAllowed() {
+        check(Looper.myLooper() == Looper.getMainLooper()) {
+            "performEncoderRecoveryIfAllowed must run on main looper (encoder lifecycle)"
+        }
         val now = android.os.SystemClock.uptimeMillis()
         val cooldownMs = if (deviceProfile?.allowFpsGovernor == false) RECOVERY_COOLDOWN_LOW_TIER_MS else RECOVERY_COOLDOWN_MS
         if (lastEncoderRecoveryUptimeMs > 0L && (now - lastEncoderRecoveryUptimeMs) < cooldownMs) {
@@ -2995,6 +3031,22 @@ class CameraForegroundService : LifecycleService() {
                 logFrom,
                 "Encoder recovery skipped – in cooldown (${remainingMs}ms remaining, allowFpsGovernor=${deviceProfile?.allowFpsGovernor})"
             )
+            return
+        }
+        // On devices where MediaCodec stop/release can cause native crash (e.g. Samsung M30s Exynos),
+        // skip full encoder restart and only request a keyframe. Logs showed CRASH_NATIVE (status=11)
+        // in the encoder_stop/codec_stop_before path during recovery.
+        if (DeviceQuirks.forceBufferInputMode()) {
+            if (videoEncoder != null) {
+                lastEncoderRecoveryUptimeMs = now
+                Log.w(
+                    logFrom,
+                    "Encoder recovery requested but device has quirk (avoid stop/release). Requesting keyframe only."
+                )
+                synchronized(encoderLock) {
+                    videoEncoder?.requestSyncFrame()
+                }
+            }
             return
         }
         if (videoEncoder != null) {
@@ -3025,12 +3077,20 @@ class CameraForegroundService : LifecycleService() {
     }
 
     /* ---------------- Remote Commands (post to Command Bus; handler runs on control thread) ---------------- */
-    fun onCommand(command: RemoteCommand, payload: Any? = null) {
-        commandBus?.post(remoteToStreamCommand(command, payload))
-    }
+    // Command entry point: ViewerSession calls the onCommand callback passed by StreamServer.createSession().
+    // That lambda posts to commandBus (and for REQ_KEYFRAME does session-specific CSD/STREAM_ACCEPTED). No service method is invoked.
 
     /** Invoked on the control thread by CommandBus. Never call from session/accept threads. */
+    @Volatile private var commandConsumerThread: Thread? = null
+
     private fun handleStreamCommand(cmd: StreamCommand) {
+        // Defensive: ensure we always run on the same thread as the CommandBus consumer (future refactors stay safe).
+        val current = Thread.currentThread()
+        val expected = commandConsumerThread
+        if (expected == null) commandConsumerThread = current else check(expected === current) {
+            "handleStreamCommand must run on command consumer thread (expected=$expected, current=$current)"
+        }
+        // Recording start/stop are already offloaded to recordingControlExecutor (no DB/File/MediaMuxer on this thread).
         when (cmd) {
             is StreamCommand.RequestKeyframe -> {
                 synchronized(encoderLock) {
@@ -3748,8 +3808,16 @@ class CameraForegroundService : LifecycleService() {
         // trigger a native crash (SIGSEGV / status=11) in vendor MediaCodec / camera HAL.
         // For those devices we prefer stability: keep a fixed encoder resolution (Buffer Mode) and only adjust
         // bitrate at runtime (MediaCodec.setParameters), ignoring viewer-driven width/height/fps changes.
-        val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true)
+        // DeviceQuirks.forceBufferInputMode() ensures known-bad models (e.g. M30s) always use Buffer mode even if profile is missing/wrong.
+        val forceBufferMode = AppSettings.isForceBufferMode(this) || (deviceProfile?.preferBufferMode == true) || DeviceQuirks.forceBufferInputMode()
         val willUseBufferMode = VideoEncoder.shouldPreferBufferMode(this, forceBufferMode)
+        // #region agent log
+        DebugLog.log("primary", debugRunId, "B", "CameraForegroundService.reconfigureEncoderIfNeeded", "reconfigure_entry", mapOf(
+            "willUseBufferMode" to willUseBufferMode,
+            "requestedW" to config.width,
+            "requestedH" to config.height
+        ))
+        // #endregion
         if (willUseBufferMode) {
             // Resolve the fixed buffer-mode encoder resolution based on requested orientation.
             val portrait = resolvedCfg.width < resolvedCfg.height
@@ -3811,6 +3879,9 @@ class CameraForegroundService : LifecycleService() {
                 logFrom,
                 "🟠 [RESOLUTION] Buffer Mode: kept fixed encoder ${fixedW}x${fixedH}; applied bitrate=${resolvedCfg.bitrate} (requested=${resolvedCfg.width}x${resolvedCfg.height}@${resolvedCfg.fps})"
             )
+            // #region agent log
+            DebugLog.log("primary", debugRunId, "B", "CameraForegroundService.reconfigureEncoderIfNeeded", "buffer_early_return", mapOf("event" to "buffer_early_return"))
+            // #endregion
             return
         }
 
@@ -3828,6 +3899,9 @@ class CameraForegroundService : LifecycleService() {
         cameraExecutor.execute {
             synchronized(encoderLock) {
                 try {
+                    // #region agent log
+                    DebugLog.log("primary", debugRunId, "B", "CameraForegroundService.reconfigureEncoderIfNeeded", "reconfigure_stop_encoder", mapOf("event" to "reconfigure_stop_encoder_surface_path"))
+                    // #endregion
                     stopEncoder()
 
                     if (resolvedCfg.bitrate != currentBitrate) {
@@ -3921,7 +3995,7 @@ class CameraForegroundService : LifecycleService() {
 
                     videoEncoder?.requestSyncFrame()
                     lastKeyframeUptimeMs = android.os.SystemClock.uptimeMillis()
-                    rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS.toLong())
+                    rebindHandler.postDelayed(encoderWatchdogRunnable, ENCODER_WATCHDOG_CHECK_INTERVAL_MS)
 
                     Log.d(
                         logFrom,

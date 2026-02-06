@@ -10,7 +10,8 @@ import java.util.concurrent.Executors
  *
  * - [ioExecutor]: accept loop (StreamServer), other I/O
  * - [senderExecutor]: StreamServer fan-out sender loop
- * - [controlExecutor]: recording control, camera bind/unbind
+ * - [controlExecutor]: CommandBus consumer loop, camera bind/unbind (single thread; do not use for recording — CommandBus blocks it)
+ * - [recordingExecutor]: start/stop recording only (separate so it is not starved by CommandBus)
  * - [encodingExecutor]: ImageAnalysis and other encoding-related work (kept separate from control to avoid stalls)
  * - [sessionPool]: fixed pool for ViewerSession runnables (listener, video sender, audio sender, heartbeat); caps total session threads
  *
@@ -25,6 +26,7 @@ object StreamingExecutors {
     val ioExecutor: ExecutorService = singleThreadExecutor("CCTV-IO")
     val senderExecutor: ExecutorService = singleThreadExecutor("CCTV-Sender")
     val controlExecutor: ExecutorService = singleThreadExecutor("CCTV-Control")
+    val recordingExecutor: ExecutorService = singleThreadExecutor("CCTV-Recording")
     val encodingExecutor: ExecutorService = singleThreadExecutor("CCTV-Encoding")
 
     /** Fixed pool for per-session work (listener, video sender, audio sender, heartbeat). Supports up to 4 concurrent viewers. */

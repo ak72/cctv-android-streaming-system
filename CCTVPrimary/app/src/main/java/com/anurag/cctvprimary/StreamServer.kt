@@ -7,6 +7,7 @@ import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicLong
 enum class RemoteCommand {
     START_RECORDING, STOP_RECORDING, BACKPRESSURE, PRESSURE_CLEAR, REQ_KEYFRAME, SWITCH_CAMERA, ZOOM, ADJUST_BITRATE
 }
@@ -84,6 +85,9 @@ class StreamServer(
 
     private var serverSocket: ServerSocket? = null
     @Volatile private var senderRunning = false
+
+    /** Frames dropped at FrameBus (non-keyframe when full). Reset each metrics log interval. */
+    private val droppedFramesSinceLastLog = AtomicLong(0L)
 
     // Use shared executors to avoid thread explosion (StreamingExecutors)
     private val acceptExecutor: ExecutorService get() = StreamingExecutors.ioExecutor
@@ -493,6 +497,7 @@ class StreamServer(
             return
         }
 
+        // DROP_NON_KEYFRAME_ON_FULL: see FrameBus class doc. Caller checks return value and prioritizes keyframe or drops.
         val offered = frameBus.publish(frame)
         val queueSizeAfter = frameBus.size()
         if (!offered) {
@@ -510,6 +515,7 @@ class StreamServer(
                         "size=${frame.data.size}, queueSizeAfter=${frameBus.size()}, age=${frameAgeMs}ms"
                 )
             } else {
+                droppedFramesSinceLastLog.incrementAndGet()
                 Log.w(
                     logFrom,
                     "⚠️ [STREAM SERVER] FrameBus FULL (capacity=$FRAME_QUEUE_CAPACITY), dropping non-key frame: " +
@@ -545,6 +551,12 @@ class StreamServer(
         synchronized(configLock) {
             val oldConfig = activeConfig
             if (oldConfig != null) {
+                // Skip broadcast when dimensions unchanged to avoid viewer state flicker:
+                // STREAMING -> RECONFIGURING (code 2) right after first keyframe makes UI show "Recovering" while video plays.
+                if (oldConfig.width == encoderWidth && oldConfig.height == encoderHeight) {
+                    Log.d(logFrom, "[STREAM SERVER] 🔵 [RESOLUTION] Encoder resolution unchanged ${encoderWidth}x${encoderHeight} - skipping STREAM_ACCEPTED broadcast")
+                    return
+                }
                 // Update activeConfig with actual encoder dimensions, keep bitrate/fps from requested
                 activeConfig = StreamConfig(
                     width = encoderWidth,
@@ -552,7 +564,7 @@ class StreamServer(
                     bitrate = oldConfig.bitrate,
                     fps = oldConfig.fps
                 )
-                Log.d(logFrom, "[STREAM SERVER] 🔵 [RESOLUTION] Updated activeConfig from requested ${oldConfig.width}x${oldConfig.height} to actual encoder ${encoderWidth}x${encoderHeight}")
+                Log.d(logFrom, "[STREAM SERVER] 🔵 [RESOLUTION] Updated activeConfig from ${oldConfig.width}x${oldConfig.height} to actual encoder ${encoderWidth}x${encoderHeight}")
                 
                 // Broadcast updated STREAM_ACCEPTED + RECONFIGURING atomically so viewer never sees reorder on some OEM kernels
                 val now = System.currentTimeMillis()
@@ -632,7 +644,9 @@ class StreamServer(
                     if (queueSizeBefore == 0 && sessionsCount > 0) {
                         Log.d(logFrom, "🔵 [STREAM SERVER] Sender thread waiting for frame from FrameBus (queueSize=0, sessions=$sessionsCount) - waiting for encoder to produce frames...")
                     }
-                    var latest = frameBus.take()
+                    // Use timeout so stop() (senderRunning=false) interrupts the drain cleanly; take() would block forever.
+                    var latest = frameBus.pollWithTimeout(500L)
+                    if (latest == null) continue
                     var latestKey: EncodedFrame? = if (latest.isKeyFrame) latest else null
                     var framesDrained = 1
                     while (true) {
@@ -679,12 +693,11 @@ class StreamServer(
                             val sendFps = if (elapsedSeconds > 0) framesSentDelta / elapsedSeconds else 0.0
                             val currentQueueSize = frameBus.size()
                             val activeSessions = sessions.size
-                            
+                            val droppedInPeriod = droppedFramesSinceLastLog.getAndSet(0L)
                             Log.i(
                                 logFrom,
-                                "[STREAM SERVER] 📊 [PERFORMANCE] StreamServer metrics (last ${elapsedSeconds.toInt()}s): framesSent=$totalFramesSent, sendFPS=${String.format("%.1f", sendFps)}, queueSize=$currentQueueSize, activeSessions=$activeSessions"
+                                "[STREAM SERVER] 📊 [PERFORMANCE] StreamServer metrics (last ${elapsedSeconds.toInt()}s): framesSent=$totalFramesSent, sendFPS=${String.format("%.1f", sendFps)}, queueSize=$currentQueueSize, activeSessions=$activeSessions, droppedFramesSinceLastLog=$droppedInPeriod"
                             )
-                            
                             lastPerformanceLogMs = nowMs
                             lastFramesSent = totalFramesSent
                         }

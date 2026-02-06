@@ -52,6 +52,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -590,6 +591,39 @@ fun CctvScreen() {
                             Switch(rotationEnabled, onCheckedChange = { rotationEnabled = it })
                         }
 
+                        OutlinedTextField(
+                            value = limitMbText,
+                            onValueChange = { newText ->
+                                val digits = newText.filter { c -> c.isDigit() }.take(7)
+                                limitMbText = digits.ifBlank { defaultLimitMbText }
+                            },
+                            readOnly = captureState == CaptureState.RECORDING,
+                            enabled = rotationEnabled && captureState != CaptureState.RECORDING,
+                            label = { Text(stringResource(R.string.settings_storage_limit_mb)) },
+                            supportingText = {
+                                Text(
+                                    when {
+                                        captureState == CaptureState.RECORDING ->
+                                            stringResource(R.string.settings_storage_limit_readonly_recording)
+                                        rotationEnabled ->
+                                            stringResource(R.string.settings_storage_limit_rotation_on)
+                                        else ->
+                                            stringResource(R.string.settings_storage_limit_rotation_off)
+                                    }
+                                )
+                            },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                                unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                                disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                                focusedBorderColor = MaterialTheme.colorScheme.outline,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.outline
+                            )
+                        )
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically
@@ -651,26 +685,6 @@ fun CctvScreen() {
                                 )
                             }
                         }
-
-                        OutlinedTextField(
-                            value = limitMbText,
-                            enabled = rotationEnabled,
-                            onValueChange = { newText ->
-                                val digits = newText.filter { c -> c.isDigit() }.take(7)
-                                limitMbText = digits.ifBlank { defaultLimitMbText }
-                            },
-                            label = { Text(stringResource(R.string.settings_storage_limit_mb)) },
-                            supportingText = {
-                                Text(
-                                    if (rotationEnabled)
-                                        stringResource(R.string.settings_storage_limit_rotation_on)
-                                    else
-                                        stringResource(R.string.settings_storage_limit_rotation_off)
-                                )
-                            },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
                     }
                 },
                 confirmButton = {
