@@ -389,6 +389,9 @@ class VideoEncoder(
 
                     // Create input Surface AFTER configure() but BEFORE start()
                     // This Surface will be fed directly by CameraX for zero-copy hardware encoding
+                    // #region agent log
+                    DebugLog.log("primary", PrimaryDebugRunId.runId, "C", "VideoEncoder.startSurfaceMode", "surface_create_attempt", mapOf("event" to "surface_create_attempt"))
+                    // #endregion
                     inputSurface = createInputSurface()
                     if (inputSurface != null) {
                         Log.d(TAG, "✓ Encoder Surface created: $inputSurface")
@@ -478,6 +481,9 @@ class VideoEncoder(
      * Start encoder in ByteBuffer input mode (fallback)
      */
     private fun startByteBufferMode() {
+        // #region agent log
+        DebugLog.log("primary", PrimaryDebugRunId.runId, "C", "VideoEncoder.startByteBufferMode", "bytebuffer_mode_used", mapOf("event" to "bytebuffer_mode_used", "w" to width, "h" to height))
+        // #endregion
         Log.d(
             TAG,
             "🔍 [CSD DIAGNOSTIC] startByteBufferMode() called - width=$width, height=$height"
@@ -1332,6 +1338,9 @@ class VideoEncoder(
         // Ensure no encode() thread can call MediaCodec APIs while we stop/release it.
         synchronized(codecLock) {
             try {
+                // #region agent log
+                DebugLog.log("primary", PrimaryDebugRunId.runId, "E", "VideoEncoder.stopInternal", "codec_stop_before", mapOf("event" to "codec_stop_before", "useSurfaceInput" to useSurfaceInput))
+                // #endregion
                 inputSurface?.release()
                 inputSurface = null
 
@@ -1431,6 +1440,11 @@ class VideoEncoder(
             // For now, unconditional debug log for the first few attempts is safest to prove liveness
 
             val currentCount = synchronized(this@VideoEncoder) { inputFrameCount }
+            // #region agent log
+            if (currentCount.toInt() == 0) {
+                DebugLog.log("primary", PrimaryDebugRunId.runId, "D", "VideoEncoder.encode", "first_frame_bytebuffer", mapOf("event" to "first_frame_bytebuffer", "imageW" to image.width, "imageH" to image.height))
+            }
+            // #endregion
             if (currentCount < 50) {
                 Log.d(
                     TAG,

@@ -7,18 +7,18 @@ Before the first connection is possible:
     *   *Step A*: Try 1080p @ 30fps (Surface Mode). If crash/timeout ->
     *   *Step B*: Try 720p @ 30fps (Surface Mode). If crash/timeout ->
     *   *Step C*: Try 720p @ 30fps (**Buffer Mode**).
-3.  **Profile Saved**: The working configuration is written to `DeviceProfile.json`.
+3.  **Profile Saved**: The working configuration is persisted via `DeviceProfileStore` (SharedPreferences JSON, keyed by firmware fingerprint + camera).
 4.  **Ready**: The "Start Capture" button becomes enabled.
 
 
 ## 1. Connection & Handshake Workflow
 
-This process establishes the session between Viewer and Primary.
+This process establishes the session between Viewer and Primary. For a consolidated list of every protocol command and its fields, see [Protocol & Message Fields](PROTOCOL_REFERENCE.md#protocol--message-fields-consolidated).
 
 1.  **Discovery/Initiation**: User enters IP/Port in Viewer and clicks "Connect".
 2.  **TCP Connection**: `StreamClient` opens a socket to `StreamServer`.
 3.  **Protocol Handshake**:
-    *   **Viewer**: Sends `HELLO|client=viewer|version=1`
+    *   **Viewer**: Sends `HELLO|client=viewer|version=1` or `version=2` (version 2 = supports server-authoritative STREAM_STATE).
     *   **Primary**: Responds `AUTH_CHALLENGE|v=2|salt={salt}`.
     *   **Viewer**: Sends `AUTH_RESPONSE|hash={hmac_sha256(password, salt)}`.
     *   **Primary**:
@@ -28,7 +28,8 @@ This process establishes the session between Viewer and Primary.
     *   **Viewer**: Sends `CAPS|maxWidth=...|maxHeight=...` (Device limits).
     *   **Primary**: Responds `CAPS_OK`.
 5.  **Stream Setup**:
-    *   **Viewer**: Sends `SET_STREAM|width=1440|height=1080|fps=30|bitrate=2000000|ordering=0`.
+    *   **Viewer**: Sends `SET_STREAM|width=1440|height=1080|fps=30|bitrate=2000000`.
+        *   Note: newer Viewers/Primaries may include extra params; unknown params are ignored by the receiver as long as framing stays correct.
     *   **Primary**:
         *   Arbitrates the request against current Hardware limitations.
         *   Configures/Reconfigures the `VideoEncoder` if necessary (or joins existing stream).
@@ -102,6 +103,6 @@ To handle bad networks without reconnecting:
 
 1.  **Event**: Primary device rotates 90 degrees.
 2.  **No Restart**: Encoder continues running as-is (Width/Height don't flip in the encoder).
-3.  **Metadata**: Primary sends `ENC_ROT|degrees=90`.
+3.  **Metadata**: Primary sends `ENC_ROT|deg=90`.
 4.  **Client Action**: Viewer UI reads this packet and rotates the `TextureView` container 90 degrees to match.
 5.  **Result**: Smooth rotation without stream interruption.

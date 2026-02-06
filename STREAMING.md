@@ -8,7 +8,7 @@ The flow of video data is as follows:
 
 1.  **Source**: Camera Hardware (Surface) or CPU Buffer (YUV).
 2.  **Encoder**: `VideoEncoder` (MediaCodec).
-3.  **Fan-Out**: `StreamServer` (Queue).
+3.  **Fan-Out**: `StreamServer` and its **FrameBus** (bounded queue; see `FrameBus.kt` and [THREADING.md](THREADING.md)).
 4.  **Transport**: `ViewerSession` (TCP Socket).
 5.  **Decoder**: Remote Viewer (MediaCodec).
 
@@ -17,9 +17,7 @@ This is the central hub. It decouples the *Producer* (Encoder) from the *Consume
 
 *   **Session Tracking**: Maintains a count of active authenticated sessions (`activeSessionCount()`).
     *   Used by `CameraForegroundService` to trigger **Low Power Mode** (downgrading resolution/FPS) when the session count hits zero.
-*   **Frame Queue**: A `LinkedBlockingQueue` (capacity 60).
-    *   The Encoder pushes frames here.
-    *   The `Sender` thread pulls them.
+*   **FrameBus**: A bounded queue (see `FrameBus.kt`; capacity 60). The encoder pushes frames via `StreamServer.enqueueFrame()`; the `Sender` thread (on `StreamingExecutors.senderExecutor`) drains the FrameBus with `pollWithTimeout` and fans out to sessions.
 *   **Fan-Out Logic**:
     *   The `Sender` thread takes the *latest* frame.
     *   It iterates over all active `ViewerSession`s.
@@ -33,15 +31,15 @@ Audio is treated as a first-class stream with two-way support:
 
 *   **Downstream (Camera -> Viewer)**:
     *   Command: `AUDIO_FRAME|dir=down|size=...|rate=...|ch=...|format=aac`
-    *   Payload: Raw AAC-LC frames (with ADTS headers removed usually, or raw PCM).
+    *   Payload: AAC-LC frames. In the current Primary implementation, the payload includes an **ADTS header** + AAC payload per frame when `format=aac`.
     *   Features: Volume boosted (1.5x), Soft Limited, Compressed (64kbps).
 
 *   **Upstream (Viewer -> Camera)**:
-    *   Command: `AUDIO_FRAME|size=...|...`
-    *   Payload: Raw PCM (for low latency talkback).
+    *   Command: `AUDIO_FRAME|dir=up|size=...|rate=48000|ch=1`
+    *   Payload: Raw PCM16LE (for low latency talkback).
 
 ## 4b. Protocol & Data Format
-The stream wraps raw H.264 NAL units in a custom lightweight container.
+The stream wraps raw H.264 NAL units in a custom lightweight container. For a single list of all protocol commands and fields, see [Protocol & Message Fields](PROTOCOL_REFERENCE.md#protocol--message-fields-consolidated).
 
 ### A. Codec Specific Data (CSD)
 Before any video plays, the Decoder needs the `SPS` (Sequence Parameter Set) and `PPS` (Picture Parameter Set).
@@ -53,6 +51,12 @@ Before any video plays, the Decoder needs the `SPS` (Sequence Parameter Set) and
 Each frame is sent as a packet:
 *   **Header**: `FRAME|epoch=...|size={bytes}|key={boolean}|tsUs={timestamp}|...`
 *   **Payload**: The raw H.264 byte stream.
+
+Common optional fields (newer builds):
+- `seq=...` (monotonic per-epoch sequence number; useful for gap diagnostics)
+- `srvMs=...` (Primary wall-clock send time in ms)
+- `capMs=...` (Primary capture wall-clock time in ms)
+- `ageMs=...` (capture→send age computed on Primary)
 
 ### C. Epochs
 To handle resolution changes (e.g., user switches 720p -> 480p), we use **Epochs**.
@@ -74,11 +78,14 @@ The system adapts to network conditions dynamically.
 *   **Benefit**: No glitch, no freeze, just lower quality to maintain fluidity.
 
 ### B. Backpressure Handling
-*   **Detection**: If `ViewerSession`'s internal socket buffer fills up.
-*   **Action**:
-    1.  **Drop Frames**: `ViewerSession` starts dropping P-Frames (non-key frames) to let the TCP queue drain.
-    2.  **Keyframe Preservation**: It tries hard *not* to drop Keyframes, as that causes artifacts (grey smearing) for seconds.
-    3.  **Client Notification**: Sends `BACKPRESSURE` command to Viewer (optional, debug).
+Backpressure is handled in multiple layers:
+
+*   **Viewer -> Primary signal**:
+    *   If the Viewer detects it is falling behind, it sends `BACKPRESSURE` (and later `PRESSURE_CLEAR`) to the Primary.
+    *   The Primary uses this as a *proxy* signal for network/receiver stress and may lower bitrate (seamless) to recover.
+*   **Primary-side load shedding**:
+    1.  **StreamServer** prefers to broadcast the most recent frame (and prefers keyframes when present) to keep latency bounded.
+    2.  **ViewerSession** maintains per-session queues and will drop older frames under sustained network slowness, prioritizing keyframes when possible.
 
 ## 6. Latency Management
 Real-time surveillance requires minimal delay (sub-500ms).

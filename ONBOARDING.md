@@ -22,7 +22,7 @@ Do not skip files. The system is complex, and "guessing" how the streaming proto
 ### Phase 2: The Core Tech (The "Hard Stuff")
 
 5.  **[CONNECTIONS.md](CONNECTIONS.md)**: How the TCP Handshake, Authentication, and Session Management work.
-6.  **[PROTOCOL_REFERENCE.md](PROTOCOL_REFERENCE.md)**: The "Cheat Sheet" of every network command (`HELLO`, `FRAME`, `CSD`). Keep this open while coding.
+6.  **[PROTOCOL_REFERENCE.md](PROTOCOL_REFERENCE.md)**: The "Cheat Sheet" of every network command. The [Protocol & Message Fields](PROTOCOL_REFERENCE.md#protocol--message-fields-consolidated) section lists every command and its fields in one place—keep it open while coding.
 7.  **[STREAMING.md](STREAMING.md)**: The Video Pipeline. Explains "Fan-Out", "Epochs" (critical for resolution changes), and Adaptive Bitrate.
 8.  **[VIDEO_ENCODING.md](VIDEO_ENCODING.md)**: Deep dive into the Primary's Encoder (Surface Mode vs Buffer Mode).
 9.  **[VIEWER_ARCHITECTURE.md](VIEWER_ARCHITECTURE.md)**: Deep dive into the Viewer's Jitter Buffer and Rendering Loop.
@@ -39,13 +39,7 @@ Do not skip files. The system is complex, and "guessing" how the streaming proto
 
 ### Phase 5: Reference Materials
 
-The `Docs/References/` folder contains official Android documentation snapshots for:
-
-- **CameraX**
-- **Activity Lifecycle**
-- **Views & UI**
-
-Cursor AI should consult these when implementing standard Android patterns.
+For standard Android patterns (e.g. **CameraX**, **Activity Lifecycle**, **Views & UI**), consult the official Android documentation. Cursor AI should use these when implementing standard Android patterns.
 
 ---
 

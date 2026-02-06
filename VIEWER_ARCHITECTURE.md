@@ -1,7 +1,7 @@
 # Viewer Application Architecture
 
 ## 1. Overview
-The **CCTVViewer** app is a complex real-time video receiver. Unlike a standard video player (ExoPlayer/VLC) which buffers seconds of content, this app must play video with **minimum latency** (sub-500ms) while handling network jitter, packet loss, and device diversity.
+The **CCTVViewer** app is a complex real-time video receiver. Unlike a standard video player (ExoPlayer/VLC) which buffers seconds of content, this app must play video with **minimum latency** (sub-500ms) while handling network jitter, packet loss, and device diversity. For the full list of protocol commands and message fields, see [Protocol & Message Fields](PROTOCOL_REFERENCE.md#protocol--message-fields-consolidated).
 
 ## 2. Core Components `(StreamClient.kt)`
 The `StreamClient` class orchestrates the entire session. It uses a **multi-threaded architecture** to prevent blocking the UI or the network.
@@ -31,7 +31,7 @@ The `StreamClient` class orchestrates the entire session. It uses a **multi-thre
 *   **Adaptive Logic**: The system monitors inter-arrival times and calculates an EWMA (Exponential Weighted Moving Average) of jitter. It dynamically adjusts the target queue size:
     *   **Low Jitter (LAN)**: 2 frames (Min latency).
     *   **High Jitter (WAN/WiFi)**: Up to 4 frames (Smoothness).
-*   **Latency Control**: If the queue grows beyond the target (latency increasing), the Viewer drops frames directly or sends `BACKPRESSURE` to the Primary.
+*   **Latency Control**: If the queue grows beyond the target (latency increasing), the Viewer trims backlog and can send `BACKPRESSURE` / `PRESSURE_CLEAR` to the Primary.
 
 ### B. One-Surface-Two-Renderers
 To support the widest range of devices, the Viewer supports two rendering modes:
@@ -41,22 +41,29 @@ To support the widest range of devices, the Viewer supports two rendering modes:
 2.  **TextureView (Fallback)**:
     *   *Pros*: Works on almost everything. Supports complex transforms (Zoom/Pan).
     *   *Cons*: Higher battery usage.
-*   **Auto-Fallback**: The app attempts SurfaceView first. If `PixelCopy` detects a black screen after connection, it automatically switches to TextureView.
+*   **Renderer policy (current implementation)**:
+    *   **Known-bad devices**: The app force-disables SurfaceView on a small quirk list (e.g., specific Samsung models) and persists that choice.
+    *   **SurfaceView correctness**: The app uses `PixelCopy` sampling to confirm that *real pixels* are visible before declaring the preview “Playing”.
+    *   **TextureView correctness**: The app avoids applying placeholder buffer sizes and only transforms once decoder output dimensions are known (prevents persistent “zoomed” preview on some devices).
 
 ## 4. State Management
 The `ConnectionState` enum drives the UI:
 1.  **DISCONNECTED**: Idle.
 2.  **CONNECTING**: Socket opening.
-3.  **CONNECTED**: TCP open, waiting for Handshake.
+3.  **CONNECTED**: TCP open, waiting for handshake or "No Video" (stream not yet active).
 4.  **AUTHENTICATED**: Password accepted.
-5.  **STREAMING**: First frame received.
+5.  **STREAMING**: Stream active; server has sent STREAM_STATE ACTIVE (after first keyframe).
 6.  **RECOVERING**: Automatic attempt to restore stall (re-negotiate).
+7.  **IDLE**: Stream intentionally stopped by server (STREAM_STATE|4). Pipeline inactive; distinct from CONNECTED.
 
 ## 5. Resilience & Watchdogs
 Real-world networks are unstable. The Viewer employs aggressive self-healing:
 *   **Connection Watchdog**:
-    *   **Dead Socket**: If no PING/PONG for 10s, kills socket.
-    *   **Stalled Frames**: If frames stop arriving (>6s) or never arrive (>12s), it downgrades state to attempt recovery.
+    *   **Handshake watchdog**: If no `AUTH_OK` after ~10s of TCP connect, it forces a reconnect.
+    *   **Start-stall watchdog**: If authenticated but no frames start, it retries negotiation (re-sends `CAPS` + `SET_STREAM`) and requests keyframes. It downgrades UI to `CONNECTED` ("No Video") after ~12s, and may reconnect after ~25s (unless in a recording/reconfigure grace window).
+    *   **Connected/No-Video watchdog**: If PONGs stop for a short, state-dependent timeout (≈7s normally, longer if audio is flowing or during grace), it disconnects to recover. Otherwise it escalates in steps: keyframe probe → renegotiate → reconnect (last resort).
+*   **Stream watchdog**:
+    *   If the app is `STREAMING` but frames stall for ~2s, it requests a keyframe and downgrades to `CONNECTED` ("No Video") unless audio/grace indicates an expected pause.
 *   **Render Watchdog**: If the decoder stops producing output (e.g., background corruption), it resets the decoder.
 *   **Reconnect Loop**: If disconnected, it attempts to reconnect with **Exponential Backoff**:
     *   Delays: 1s -> 2s -> 4s -> 8s -> 10s (capped).
@@ -68,7 +75,7 @@ Real-world networks are unstable. The Viewer employs aggressive self-healing:
 ## 6. Lifecycle & Backgrounding
 To ensure reliability and battery efficiency, `StreamClient` handles Android lifecycle events explicitly:
 *   **Backgrounded (`onAppBackgrounded`)**:
-    *   **Action**: Intentionally closes the TCP socket and releases the Decoder.
+    *   **Action**: Intentionally closes the TCP socket to prevent server-side “connection reset” churn and to avoid wasting battery/data while not visible.
     *   **Reason**: Prevents "Connection Reset" errors on the Server, stops battery drain, and avoids accumulating stale frames while invisible.
 *   **Foregrounded (`onAppForegrounded`)**:
     *   **Action**: Automatically calls `connect()` to restore the session.
@@ -76,7 +83,7 @@ To ensure reliability and battery efficiency, `StreamClient` handles Android lif
 
 ## 7. Talkback (Two-Way Audio)
 *   **Input**: `AudioRecord` (Viewer Mic).
-*   **Transport**: Muted by default to prevent feedback loops.
+*   **Transport**: Push-to-talk; audio is sent upstream only while active.
 *   **Push-to-Talk**: When the button is held, audio is recorded and sent upstream via the `Sender` thread.
 
 ## 8. Device Specific Mitigations

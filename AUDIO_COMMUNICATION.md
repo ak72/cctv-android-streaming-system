@@ -34,10 +34,9 @@ The `AudioSourceEngine` intelligently picks the best microphone source:
 
 ### A. Architecture
 *   **Source**: Viewer Microphone.
-*   **Format**: Raw PCM (16-bit, 48kHz) or AAC (depending on Viewer impl).
-    *   *Currently*: Raw PCM is often used for lowest latency interaction.
+*   **Format**: Raw PCM16LE (16-bit, 48kHz, mono) for lowest latency interaction.
 *   **Transport**: TCP Upload.
-    *   Command: `AUDIO_FRAME|dir=up|size=...`
+    *   Command: `AUDIO_FRAME|dir=up|size=...|rate=48000|ch=1`
 *   **Destination**: `CameraForegroundService` -> `AudioTrack`.
 
 ### B. Playback `(CameraForegroundService.kt)`

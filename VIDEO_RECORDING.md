@@ -21,7 +21,7 @@ The recording process uses a custom implementation based on Android's `MediaCode
     *   **Bitrate**: VBR (Matching stream settings).
     *   **Resolution**: 
         *   **Surface Mode**: Full resolution (aligned to 16).
-        *   **Buffer Mode**: Matches streaming resolution (e.g., 960x720).
+        *   **Buffer Mode**: Matches the negotiated streaming resolution (fixed 4:3 sizes, e.g. **720x960** portrait or **960x720** landscape).
 
 ### B. Audio Source
 *   **Component**: `AudioSourceEngine` (Singleton).
@@ -34,9 +34,12 @@ The recording process uses a custom implementation based on Android's `MediaCode
 *   **Process**:
     1.  Receives encoded H.264 NAL units and AAC ADTS frames.
     2.  Write them into an MP4 container.
-    3.  **Rotation**: Sets an orientation hint in MP4 metadata.
+    3.  **Rotation**:
+        *   **Surface Mode**: Prefer MP4 container orientation hint (`MediaMuxer.setOrientationHint(...)`) to avoid rotating pixels in Kotlin.
+        *   **Buffer Mode**: Keep container hint at `0` and rotate pixels in the YUV conversion path (matches the streaming orientation/constraints).
 
 ### D. Technical Considerations
+*   **Threading**: Start/stop recording run on a dedicated **recording executor** (`StreamingExecutors.recordingExecutor`), not the control executor, so they are never starved by the Command Bus. See `Docs/THREADING.md`.
 *   **Scoped Storage Compatibility**: Uses `MediaMuxer(FileDescriptor)` to support Android 10+ SAF.
 *   **Crash-Safe Recovery**:
     *   If the app crashes or restarts while state is `RECORDING`, the service detects the inconsistent state (persisted "RECORDING" flag vs. no active generic recorder).
