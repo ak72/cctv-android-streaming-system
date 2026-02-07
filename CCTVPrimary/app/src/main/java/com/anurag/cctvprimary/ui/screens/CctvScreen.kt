@@ -472,9 +472,10 @@ fun CctvScreen() {
                 }
 
                 // Camera switch overlay button (transparent icon-style), centered at bottom of preview.
+                // Allow switch during PREVIEW or RECORDING (tryRebind uses includeVideoCapture when RECORDING).
                 IconButton(
                     onClick = { cameraService?.requestSwitchCamera() },
-                    enabled = captureState == CaptureState.PREVIEW,
+                    enabled = captureState == CaptureState.PREVIEW || captureState == CaptureState.RECORDING,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 8.dp)

@@ -12,7 +12,7 @@ import java.nio.ByteOrder
  * Key rule: do NOT mix BufferedReader/Reader-based line reading with raw InputStream reads,
  * because Reader implementations can buffer/prefetch bytes and corrupt binary framing.
  *
- * Framed transport (protocol version >= 3): video frames are sent as [marker][header][payload]
+ * Framed transport (protocol version >= 3): video frames are sent as [marker][header-payload]
  * so the viewer reads exact bytes with no text parsing. Header: epoch (4B), flags (4B), size (4B), big-endian.
  */
 object ProtocolIO {
@@ -22,7 +22,8 @@ object ProtocolIO {
     /** Fixed header size: marker (1) + epoch (4) + flags (4) + size (4) = 13 bytes. */
     const val BINARY_FRAME_HEADER_SIZE: Int = 13
 
-    private val headerBuffer = ByteBuffer.allocate(BINARY_FRAME_HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
+    private val headerBuffer =
+        ByteBuffer.allocate(BINARY_FRAME_HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
 
     /**
      * Write a binary video frame: [marker][epoch][flags][size][payload].
@@ -30,7 +31,12 @@ object ProtocolIO {
      * Flags: bit0 = keyframe (1), else 0.
      */
     @Synchronized
-    fun writeBinaryVideoFrame(out: OutputStream, epoch: Long, keyframe: Boolean, payload: ByteArray) {
+    fun writeBinaryVideoFrame(
+        out: OutputStream,
+        epoch: Long,
+        keyframe: Boolean,
+        payload: ByteArray
+    ) {
         headerBuffer.clear()
         headerBuffer.put(BINARY_FRAME_MARKER.toByte())
         headerBuffer.putInt(epoch.toInt())
@@ -44,6 +50,8 @@ object ProtocolIO {
      * Read the binary frame header (after the marker byte). Caller must have already read the marker.
      * Returns (epoch, flags, size). Uses the shared header buffer; not thread-safe for concurrent reads.
      */
+    /* readBinaryFrameHeader is the read-side API for binary framing (protocol v3), reserved for future Viewer support.*/
+    @Suppress("unused")
     fun readBinaryFrameHeader(input: InputStream): Triple<Long, Int, Int> {
         val buf = ByteArray(12)
         readFullyExact(input, buf)
@@ -53,6 +61,7 @@ object ProtocolIO {
         val size = bb.int
         return Triple(epoch, flags, size)
     }
+
     fun readLineUtf8(input: InputStream): String? {
         val sb = StringBuilder(128)
         while (true) {

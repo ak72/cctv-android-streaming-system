@@ -62,6 +62,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.input.pointer.pointerInput
@@ -216,6 +217,8 @@ class MainActivity : ComponentActivity() {
                         }
                         var state by remember { mutableStateOf(ConnectionState.DISCONNECTED) }
                         var prevStateForToast by remember { mutableStateOf(ConnectionState.DISCONNECTED) }
+                        /** Once true, we clear focus from the IP field when returning to DISCONNECTED so the keyboard does not auto-show after a successful connection. */
+                        var connectionEverSucceeded by remember { mutableStateOf(false) }
                         var lastError by remember { mutableStateOf<String?>(null) }
                         var rotationDeg by remember { mutableIntStateOf(0) }
                         // NOTE:
@@ -252,9 +255,16 @@ class MainActivity : ComponentActivity() {
                         // SurfaceView readiness needs to be stable: require a few consecutive "good" PixelCopy samples
                         // so we don't accidentally unhide on a transient or stale copy.
                         var surfaceReadyStreak by remember { mutableIntStateOf(0) }
-                        // Some devices show a tiny bar after resume/renegotiation even when layout sizes look stable.
-                        // Re-applying the transform on the *first decoded frame* is the most reliable fix.
-                        var pendingFirstFrameTransform by remember { mutableStateOf(false) }
+                        // 3-gate renderer: transform only when view laid out, surface ready, and video dimensions known.
+                        // Prevents permanent bad state when transform was skipped (e.g. width=0) but a flag was cleared.
+                        var viewReady by remember { mutableStateOf(false) }
+                        var surfaceReady by remember { mutableStateOf(false) }
+                        // Cache: only recompute when inputs change (reduces CPU/battery).
+                        var lastAppliedVideoW by remember { mutableIntStateOf(0) }
+                        var lastAppliedVideoH by remember { mutableIntStateOf(0) }
+                        var lastAppliedViewW by remember { mutableIntStateOf(0) }
+                        var lastAppliedViewH by remember { mutableIntStateOf(0) }
+                        var firstTransformLogged by remember { mutableStateOf(false) }
                         // Texture update tracking for diagnostics
                         var textureUpdateCounter by remember { mutableLongStateOf(0L) }
                         var textureUpdateFirstTime by remember { mutableLongStateOf(0L) }
@@ -402,12 +412,22 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-// Load last successful IP once, when composable starts
+// Load last successful IP and connection-ever-succeeded once, when composable starts
                         LaunchedEffect(Unit) {
                             val prefs = context.getSharedPreferences("cctv_viewer", MODE_PRIVATE)
                             val saved = prefs.getString("last_server_ip", null)
                             if (!saved.isNullOrBlank()) {
                                 serverIp = saved
+                            }
+                            connectionEverSucceeded = prefs.getBoolean("connection_ever_succeeded", false)
+                        }
+                        // After first successful connection, persist so we stop auto-focusing the IP field on later disconnects/relaunches
+                        LaunchedEffect(state) {
+                            if (state == ConnectionState.STREAMING || state == ConnectionState.CONNECTED) {
+                                context.getSharedPreferences("cctv_viewer", MODE_PRIVATE).edit {
+                                    putBoolean("connection_ever_succeeded", true)
+                                }
+                                connectionEverSucceeded = true
                             }
                         }
 
@@ -526,7 +546,6 @@ class MainActivity : ComponentActivity() {
                             if (state != ConnectionState.DISCONNECTED) return@LaunchedEffect
                             hasPreviewFrame = false
                             decoderReportedFirstRender = false
-                            pendingFirstFrameTransform = true
                             // CRITICAL:
                             // On TextureView we hide the view (alpha=0) until we detect the *first rendered frame*
                             // via onSurfaceTextureUpdated(). That "first frame" detection uses textureUpdateCounter==0.
@@ -579,7 +598,6 @@ class MainActivity : ComponentActivity() {
                                 }
                                 hasPreviewFrame = false
                                 decoderReportedFirstRender = false
-                                pendingFirstFrameTransform = true
                                 textureUpdateCounter = 0L
                                 textureUpdateFirstTime = 0L
                                 // Clear view references to force recreation with new view type
@@ -587,7 +605,7 @@ class MainActivity : ComponentActivity() {
                                 surfaceViewRef = null
                             }
                             // Compose state update (next run compares against this).
-                            @Suppress("UNUSED_VALUE")
+                            @Suppress("AssignedValueIsNeverRead")
                             lastRendererWasSurfaceView = useSurfaceView
                         }
 
@@ -608,7 +626,7 @@ class MainActivity : ComponentActivity() {
                                 talkActive = false
                             }
                             // Reset flag after handling
-                            @Suppress("UNUSED_VALUE")
+                            @Suppress("AssignedValueIsNeverRead")
                             forceStopTalk = false
                         }
 
@@ -685,7 +703,7 @@ class MainActivity : ComponentActivity() {
                         // AUTO-FALLBACK: If we reach STREAMING but no frame is rendered, switch SurfaceView <-> TextureView once.
                         LaunchedEffect(state, hasPreviewFrame) {
                             if (state == ConnectionState.DISCONNECTED) {
-                                @Suppress("UNUSED_VALUE")
+                                @Suppress("AssignedValueIsNeverRead")
                                 autoFallbackAttempted = false
                                 return@LaunchedEffect
                             }
@@ -704,9 +722,8 @@ class MainActivity : ComponentActivity() {
                             // Give the decoder + encoder time to negotiate and deliver the first keyframe.
                             delay(5000)
                             if ((state == ConnectionState.STREAMING || state == ConnectionState.RECOVERING) && !hasPreviewFrame && !autoFallbackAttempted) {
-                                @Suppress("UNUSED_VALUE")
+                                @Suppress("AssignedValueIsNeverRead")
                                 autoFallbackAttempted = true
-                                val newMode = true // TextureView -> SurfaceView only
                                 Log.w(
                                     "CCTV_VIEWER",
                                     "[VIEWER MA] ⚠️ [SURFACE] No preview frame after 5s in STREAMING; switching renderer TextureView -> SurfaceView"
@@ -718,7 +735,7 @@ class MainActivity : ComponentActivity() {
                                 // IMPORTANT: Do NOT persist fallback choice.
                                 // Fallback is a per-session recovery mechanism; the user's setting (and default SurfaceView)
                                 // should remain stable across reconnects.
-                                useSurfaceView = newMode
+                                useSurfaceView = true // TextureView -> SurfaceView only
                                 Toast.makeText(
                                     context,
                                       "Video preview fallback: switched to SurfaceView",
@@ -743,6 +760,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        /** @return true if transform was applied (FIT), false if skipped (e.g. view not laid out). When false, TextureView keeps default FILL → zoomed preview. */
                         fun applyTextureTransform(
                             tv: TextureView,
                             srcW: Int,
@@ -750,15 +768,15 @@ class MainActivity : ComponentActivity() {
                             rotation: Int,
                             isFrontCamera: Boolean,
                             reason: String
-                        ) {
+                        ): Boolean {
                             val vw = tv.width
                             val vh = tv.height
                             if (vw <= 0 || vh <= 0 || srcW <= 0 || srcH <= 0) {
                                 Log.d(
                                     "CCTV_VIEWER",
-                                    "[VIEWER MA] Transform skip $reason vw=$vw vh=$vh src=${srcW}x${srcH}"
+                                    "[VIEWER MA] Transform skip $reason vw=$vw vh=$vh decoded=${srcW}x${srcH} (FIT not applied → preview may look zoomed)"
                                 )
-                                return
+                                return false
                             }
 
                             val rot = ((rotation % 360) + 360) % 360
@@ -837,10 +855,46 @@ class MainActivity : ComponentActivity() {
 
                             tv.setTransform(m)
 
-                            Log.d(
-                                "CCTV_VIEWER",
-                                "[VIEWER MA] Transform applied $reason view=${vw}x${vh} src=${srcW}x${srcH} content=${contentW.toInt()}x${contentH.toInt()} rot=$rot rotContent=${rotW.toInt()}x${rotH.toInt()} scale=${"%.4f".format(fitScale)} cropUsed=$cropLooksLikePadding cropValid=$cropValid crop=${cropL},${cropT},${cropR},${cropB}"
-                            )
+                            val videoAr = if (srcH > 0) srcW.toFloat() / srcH else 0f
+                            val viewAr = if (vh > 0) vw.toFloat() / vh else 0f
+                            if (reason != "perFrame") {
+                                Log.d(
+                                    "CCTV_VIEWER",
+                                    "[VIEWER MA] Transform applied (FIT) $reason decoded=${srcW}x${srcH} view=${vw}x${vh} videoAspect=${"%.3f".format(videoAr)} viewAspect=${"%.3f".format(viewAr)} scale=${"%.4f".format(fitScale)} rot=$rot cropUsed=$cropLooksLikePadding"
+                                )
+                            }
+                            return true
+                        }
+
+                        /**
+                         * 3-gate apply: only runs when view laid out, surface ready, and video dimensions known.
+                         * Never clears readiness flags; only applies when transform actually succeeds.
+                         * @param fromTextureUpdate true when called from onSurfaceTextureUpdated (e.g. Samsung): skip cache so we re-apply every frame.
+                         */
+                        fun maybeApplyTransform(tv: TextureView, fromTextureUpdate: Boolean = false) {
+                            if (!viewReady || !surfaceReady) return
+                            val (w, h) = if (videoW > 0 && videoH > 0) videoW to videoH else (client.getAcceptedVideoDimensions() ?: (0 to 0))
+                            if (w <= 0 || h <= 0) return
+                            val vw = tv.width
+                            val vh = tv.height
+                            if (vw <= 0 || vh <= 0) return
+                            if (!fromTextureUpdate && lastAppliedVideoW == w && lastAppliedVideoH == h && lastAppliedViewW == vw && lastAppliedViewH == vh) return
+                            val reason = if (firstTransformLogged) "perFrame" else "firstFrame"
+                            val applied = applyTextureTransform(tv, w, h, 0, isFrontCamera, reason)
+                            @Suppress("AssignedValueIsNeverRead")
+                            if (applied) {
+                                lastAppliedVideoW = w
+                                lastAppliedVideoH = h
+                                lastAppliedViewW = vw
+                                lastAppliedViewH = vh
+                                if (!firstTransformLogged) {
+                                    Log.w(
+                                        "CCTV_VIEWER",
+                                        "[VIEWER MA] 🔴 [TEXTURE RENDER] First transform applied (3-gate): view=${vw}x${vh}, video=${w}x${h}"
+                                    )
+                                    firstTransformLogged = true
+                                }
+                            }
                         }
 
                         // NOTE:
@@ -851,39 +905,15 @@ class MainActivity : ComponentActivity() {
 
                         // TextureView: do NOT apply encoder rotation metadata.
                         // Rotation is treated as label-only to preserve the older stable behavior.
-                        val textureRotationDeg = 0
 
                         LaunchedEffect(
                             videoW, videoH, cropL, cropT, cropR, cropB, isFrontCamera
                         ) {
                             if (useSurfaceView) return@LaunchedEffect
-                            pendingFirstFrameTransform = true
                             textureViewRef?.let { tv ->
-                                tv.post {
-                                    applyTextureTransform(
-                                        tv, videoW, videoH, textureRotationDeg, isFrontCamera, "sizeChange"
-                                    )
-                                }
-                                tv.postDelayed({
-                                    applyTextureTransform(
-                                        tv,
-                                        videoW,
-                                        videoH,
-                                        textureRotationDeg,
-                                        isFrontCamera,
-                                        "sizeChange+50ms"
-                                    )
-                                }, 50)
-                                tv.postDelayed({
-                                    applyTextureTransform(
-                                        tv,
-                                        videoW,
-                                        videoH,
-                                        textureRotationDeg,
-                                        isFrontCamera,
-                                        "sizeChange+200ms"
-                                    )
-                                }, 200)
+                                tv.post { maybeApplyTransform(tv) }
+                                tv.postDelayed({ maybeApplyTransform(tv) }, 50)
+                                tv.postDelayed({ maybeApplyTransform(tv) }, 200)
                             }
                         }
 
@@ -893,18 +923,7 @@ class MainActivity : ComponentActivity() {
                         LaunchedEffect(isFrontCamera, videoW, videoH) {
                             if (useSurfaceView) return@LaunchedEffect
                             textureViewRef?.let { tv ->
-                                if (videoW > 0 && videoH > 0) {
-                                    tv.post {
-                                        applyTextureTransform(
-                                            tv,
-                                            videoW,
-                                            videoH,
-                                            textureRotationDeg,
-                                            isFrontCamera,
-                                            "cameraFacingChange"
-                                        )
-                                    }
-                                }
+                                if (videoW > 0 && videoH > 0) tv.post { maybeApplyTransform(tv) }
                             }
                         }
 
@@ -920,53 +939,15 @@ class MainActivity : ComponentActivity() {
 
                                     Lifecycle.Event.ON_START -> {
                                         client.onAppForegrounded()
-                                        pendingFirstFrameTransform = true
                                         hasPreviewFrame = false
                                         // Force re-apply transform after returning from background; layout callbacks are not always fired.
-                                        val tv = textureViewRef
-                                        val currentRotation = rotationDeg
-                                        if (!useSurfaceView) {
-                                            tv?.post {
-                                                applyTextureTransform(
-                                                    tv,
-                                                    videoW,
-                                                    videoH,
-                                                    currentRotation,
-                                                    isFrontCamera,
-                                                    "onStart"
-                                                )
+                                        textureViewRef?.let { tv ->
+                                            if (!useSurfaceView) {
+                                                tv.post { maybeApplyTransform(tv) }
+                                                tv.postDelayed({ maybeApplyTransform(tv) }, 50)
+                                                tv.postDelayed({ maybeApplyTransform(tv) }, 200)
+                                                tv.postDelayed({ maybeApplyTransform(tv) }, 500)
                                             }
-                                            // Some devices report final TextureView size a bit later; re-apply after a short delay.
-                                            tv?.postDelayed({
-                                                applyTextureTransform(
-                                                    tv,
-                                                    videoW,
-                                                    videoH,
-                                                    currentRotation,
-                                                    isFrontCamera,
-                                                    "onStart+50ms"
-                                                )
-                                            }, 50)
-                                            tv?.postDelayed({
-                                                applyTextureTransform(
-                                                    tv,
-                                                    videoW,
-                                                    videoH,
-                                                    currentRotation,
-                                                    isFrontCamera,
-                                                    "onStart+200ms"
-                                                )
-                                            }, 200)
-                                            tv?.postDelayed({
-                                                applyTextureTransform(
-                                                    tv,
-                                                    videoW,
-                                                    videoH,
-                                                    currentRotation,
-                                                    isFrontCamera,
-                                                    "onStart+500ms"
-                                                )
-                                            }, 500)
                                         }
                                     }
 
@@ -992,6 +973,17 @@ class MainActivity : ComponentActivity() {
                         val scope = rememberCoroutineScope()
                         val ipBringIntoView = remember { BringIntoViewRequester() }
                         val pwBringIntoView = remember { BringIntoViewRequester() }
+                        val focusManager = LocalFocusManager.current
+                        // When connection is established, remove focus from IP field so the keyboard dismisses.
+                        // After first success, also clear focus when returning to DISCONNECTED so the keyboard does not auto-show on later disconnects/relaunches.
+                        LaunchedEffect(state, connectionEverSucceeded) {
+                            if (state == ConnectionState.STREAMING || state == ConnectionState.CONNECTED) {
+                                focusManager.clearFocus()
+                            }
+                            if (state == ConnectionState.DISCONNECTED && connectionEverSucceeded) {
+                                focusManager.clearFocus()
+                            }
+                        }
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -1106,18 +1098,21 @@ class MainActivity : ComponentActivity() {
                                         // Keep the video view in composition even while DISCONNECTED so the Surface is already
                                         // created/attached before the first keyframe arrives. This reduces "first connect needs reconnect"
                                         // race conditions on some devices. We show a black overlay label above when disconnected.
-                                        // Compose cleanup:
-                                        // AndroidView can be disposed before Surface callbacks fire. Always detach the surface
-                                        // to prevent decoder/surface leaks or stale Surface usage. This is safe and idempotent
-                                        // (it does NOT shutdown the connection).
-                                        DisposableEffect(useSurfaceView) {
-                                            onDispose {
-                                                try {
-                                                    client.detachSurface()
-                                                } catch (_: Throwable) {
+                                        // CRITICAL: key(client) forces AndroidView to be recreated when port/password change.
+                                        // StreamClient is created via remember(password, port); when either changes, a new
+                                        // client is created. Without key(client), the AndroidView factory runs only once and
+                                        // SurfaceTextureListener/SurfaceHolder.Callback capture the old client → surface
+                                        // attaches to a disconnected/abandoned client until app restart.
+                                        key(client) {
+                                            // Compose cleanup: detach surface when this AndroidView is disposed.
+                                            DisposableEffect(useSurfaceView) {
+                                                onDispose {
+                                                    try {
+                                                        client.detachSurface()
+                                                    } catch (_: Throwable) {
+                                                    }
                                                 }
                                             }
-                                        }
 
                                         @Suppress(
                                             "UI_COMPOSABLE_EXPECTED", "ComposableTargetInLambda"
@@ -1575,6 +1570,14 @@ class MainActivity : ComponentActivity() {
                                                         textureViewRef = this
                                                         surfaceViewRef = null
                                                         hasPreviewFrame = false
+                                                        // 3-gate: new view → reset so we only apply when layout + surface + video are ready
+                                                        viewReady = false
+                                                        surfaceReady = false
+                                                        lastAppliedVideoW = 0
+                                                        lastAppliedVideoH = 0
+                                                        lastAppliedViewW = 0
+                                                        lastAppliedViewH = 0
+                                                        firstTransformLogged = false
                                                         // CRITICAL: Set isOpaque=false (matches backup working version)
                                                         // isOpaque=true can cause rendering issues on some devices
                                                         isOpaque = false
@@ -1637,19 +1640,12 @@ class MainActivity : ComponentActivity() {
                                                                         "[VIEWER MA] 🔍 [TEXTURE] Surface attached to decoder - decoder.releaseOutputBuffer(render=true) should trigger onSurfaceTextureUpdated"
                                                                     )
 
-                                                                    pendingFirstFrameTransform = true
+                                                                    surfaceReady = true
                                                                     hasPreviewFrame = false
                                                                     // Reset texture update tracking for new surface
                                                                     textureUpdateCounter = 0L
                                                                     textureUpdateFirstTime = 0L
-                                                                    applyTextureTransform(
-                                                                        this@apply,
-                                                                        videoW,
-                                                                        videoH,
-                                                                        0,
-                                                                        isFrontCamera,
-                                                                        "available"
-                                                                    )
+                                                                    maybeApplyTransform(this@apply)
                                                                 } catch (t: Throwable) {
                                                                     Log.e(
                                                                         "CCTV_VIEWER",
@@ -1670,17 +1666,7 @@ class MainActivity : ComponentActivity() {
                                                                 width: Int,
                                                                 height: Int
                                                             ) {
-                                                                pendingFirstFrameTransform = true
-                                                                // CRITICAL FIX: Use rotationDeg (matches backup working version)
-                                                                // At this point rotation should already be set from decoder callbacks
-                                                                applyTextureTransform(
-                                                                    this@apply,
-                                                                    videoW,
-                                                                    videoH,
-                                                                    rotationDeg,
-                                                                    isFrontCamera,
-                                                                    "sizeChanged"
-                                                                )
+                                                                maybeApplyTransform(this@apply)
                                                             }
 
                                                             override fun onSurfaceTextureDestroyed(
@@ -1702,6 +1688,7 @@ class MainActivity : ComponentActivity() {
                                                                 if (textureViewRef === this@apply) {
                                                                     textureViewRef = null
                                                                 }
+                                                                surfaceReady = false
                                                                 hasPreviewFrame = false
                                                                 return true
                                                             }
@@ -1759,25 +1746,8 @@ class MainActivity : ComponentActivity() {
                                                                         )
                                                                     }
 
-                                                                    if (pendingFirstFrameTransform) {
-                                                                        pendingFirstFrameTransform =
-                                                                            false
-                                                                        Log.w(
-                                                                            "CCTV_VIEWER",
-                                                                            "[VIEWER MA] 🔴 [TEXTURE RENDER] Applying first frame transform: view=${this@apply.width}x${this@apply.height}, video=${videoW}x${videoH}"
-                                                                        )
-                                                                        // UI contract:
-                                                                        // - Keep the preview container fixed (3:4).
-                                                                        // - Treat ENC_ROT as label-only (do not rotate/resize video UI based on it).
-                                                                        applyTextureTransform(
-                                                                            this@apply,
-                                                                            videoW,
-                                                                            videoH,
-                                                                            0,
-                                                                            isFrontCamera,
-                                                                            "firstFrame"
-                                                                        )
-                                                                    }
+                                                                    // Re-apply every frame when we have dimensions (Samsung M30s etc. reset matrix per frame). 3-gate inside.
+                                                                    maybeApplyTransform(this@apply, fromTextureUpdate = true)
                                                                 } catch (e: Exception) {
                                                                     Log.e(
                                                                         "CCTV_VIEWER",
@@ -1788,17 +1758,11 @@ class MainActivity : ComponentActivity() {
                                                             }
                                                         }
                                                         addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
-                                                            if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
-                                                                pendingFirstFrameTransform = true
-                                                                // Treat ENC_ROT as label-only (do not rotate/resize video UI based on it).
-                                                                applyTextureTransform(
-                                                                    this,
-                                                                    videoW,
-                                                                    videoH,
-                                                                    0,
-                                                                    isFrontCamera,
-                                                                    "layoutChanged"
-                                                                )
+                                                            val w = right - left
+                                                            val h = bottom - top
+                                                            if (w > 0 && h > 0) viewReady = true
+                                                            if (w != oldRight - oldLeft || h != oldBottom - oldTop) {
+                                                                maybeApplyTransform(this)
                                                             }
                                                         }
 
@@ -1845,6 +1809,7 @@ class MainActivity : ComponentActivity() {
                                                 // Fit/letterbox happens inside the SurfaceView (MediaCodec scaling) or TextureView matrix.
                                                 .fillMaxSize()
                                                 .graphicsLayer { clip = true })
+                                        }
 
                                         // SurfaceView pixel validation (Nord CE4 / green warmup protection).
                                         // We keep the black overlay until PixelCopy confirms non-green pixels.
@@ -2497,7 +2462,7 @@ class MainActivity : ComponentActivity() {
                                     onClick = {
                                         client.switchCamera()
                                     },
-                                    enabled = (state == ConnectionState.STREAMING || state == ConnectionState.RECOVERING) && !isRecording,
+                                    enabled = (state == ConnectionState.STREAMING || state == ConnectionState.RECOVERING),
                                     modifier = Modifier.align(Alignment.CenterEnd)
                                 ) {
                                     Icon(

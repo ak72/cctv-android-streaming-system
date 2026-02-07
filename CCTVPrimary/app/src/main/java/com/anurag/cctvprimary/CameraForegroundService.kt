@@ -1677,6 +1677,15 @@ class CameraForegroundService : LifecycleService() {
                         Log.d(logFrom, "Camera bound safely")
                         streamServer?.broadcastCameraFacing(useFrontCamera)
 
+                        // Re-apply recording sink after bind so recording continues across camera switch
+                        // (and after fallback rebind when encoder was recreated).
+                        val recorder = customRecorder
+                        if (recorder != null) {
+                            synchronized(encoderLock) {
+                                videoEncoder?.setRecordingSink(recorder)
+                            }
+                        }
+
                         // Recording can start immediately after camera bind (no VideoCapture needed)
                     } catch (ex: Exception) {
                         Log.e(logFrom, "Camera bound failed" + ex.message)
@@ -3099,6 +3108,11 @@ class CameraForegroundService : LifecycleService() {
             }
             is StreamCommand.StartRecording -> {
                 Log.d(logFrom, "Remote START_RECORDING")
+                // Ensure streaming audio is started so AudioSourceEngine is capturing before CustomRecorder
+                // registers as recording listener (fixes no-audio when recording is triggered from Viewer).
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                    startStreamingAudio()
+                }
                 startRecording(true)
             }
             is StreamCommand.StopRecording -> {
@@ -3160,10 +3174,7 @@ class CameraForegroundService : LifecycleService() {
                 }
             }
             is StreamCommand.SwitchCamera -> {
-                if (serviceState == ServiceCaptureState.RECORDING) {
-                    Log.w(logFrom, "Ignoring SWITCH_CAMERA while recording")
-                    return
-                }
+                // Switching during recording is supported: tryRebind uses includeVideoCapture when RECORDING.
                 Log.d(logFrom, "Remote SWITCH_CAMERA (primaryUiVisible=$primaryUiVisible)")
                 switchCamera(includePreview = primaryUiVisible)
             }
@@ -3279,11 +3290,8 @@ class CameraForegroundService : LifecycleService() {
     }
 
     // Called by Primary UI to switch camera locally (same behavior as viewer-triggered switch).
+    // Switching during recording is supported: tryRebind passes includeVideoCapture = (serviceState == RECORDING).
     fun requestSwitchCamera() {
-        if (serviceState == ServiceCaptureState.RECORDING) {
-            Log.w(logFrom, "Ignoring UI switch camera while recording")
-            return
-        }
         Log.d(logFrom, "UI SWITCH_CAMERA")
         switchCamera(includePreview = true)
     }

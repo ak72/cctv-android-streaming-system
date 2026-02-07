@@ -2,6 +2,7 @@ package com.anurag.cctvprimary
 
 import android.content.Context
 import android.os.Build
+import androidx.core.content.edit
 import android.util.Range
 import android.util.Size
 import org.json.JSONArray
@@ -30,10 +31,9 @@ internal object DeviceProfileStore {
     }
 
     fun save(context: Context, profile: DeviceProfile) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(key(profile.cameraId, profile.lensFacing), encode(profile).toString())
-            .apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
+            putString(key(profile.cameraId, profile.lensFacing), encode(profile).toString())
+        }
     }
 
     private fun encodeSize(s: Size): JSONObject =

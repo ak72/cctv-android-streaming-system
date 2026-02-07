@@ -2,6 +2,7 @@ package com.anurag.cctvprimary
 
 import android.content.Context
 import android.os.Build
+import androidx.core.content.edit
 
 /**
  * Persists “runtime probe” outcomes so we don’t repeat expensive/unstable experiments on every launch.
@@ -24,10 +25,9 @@ internal object EncoderProbeStore {
     }
 
     fun markSurfaceInputBad(context: Context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean(key(), true)
-            .apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
+            putBoolean(key(), true)
+        }
     }
 }
 

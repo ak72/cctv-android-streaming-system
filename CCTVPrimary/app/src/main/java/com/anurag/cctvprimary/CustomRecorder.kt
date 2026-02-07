@@ -49,12 +49,12 @@ class CustomRecorder(
     private var audioFrameCount: Long = 0L
 
     // Recording audio gain (software AGC-like boost).
-    // CRITICAL: Some devices deliver very low-gain PCM especially with UNPROCESSED source.
-    // We boost in software with a limiter to improve perceived volume without clipping.
+    // Capped conservatively: CAMCORDER/VOICE_COMMUNICATION are already hardware-processed.
+    // High gain (8x) on such input causes distortion; 2.5x max avoids amplifying echo/residual.
     private var recordGain: Float = 1.0f
-    private val recordGainMax: Float = 8.0f
+    private val recordGainMax: Float = 2.5f
     private val recordGainSmoothing: Float = 0.10f
-    private val recordTargetRms: Float = 8000f
+    private val recordTargetRms: Float = 4000f
     private var lastRecordGainLogMs: Long = 0L
     
     // Muxing
@@ -163,6 +163,7 @@ class CustomRecorder(
                 setupAudioCodec()
                 // Register as listener to AudioSourceEngine
                 AudioSourceEngine.getInstance().registerRecordingListener(this)
+                Log.d(logFrom, "[AUDIO_DIAG] CustomRecorder: registered as recording listener (triggers CAMCORDER source, AEC/AGC disabled)")
                 Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Audio codec setup completed")
             }
             
@@ -241,6 +242,7 @@ class CustomRecorder(
         // Unregister from AudioSourceEngine
         try {
             AudioSourceEngine.getInstance().unregisterRecordingListener(this)
+            Log.d(logFrom, "[AUDIO_DIAG] CustomRecorder: unregistered recording listener (AudioSourceEngine may switch back to VOICE_COMMUNICATION + AEC)")
             Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Unregistered from AudioSourceEngine")
         } catch (e: Exception) {
             Log.w(logFrom, "🔴 [CUSTOM_RECORDER] Error unregistering from AudioSourceEngine", e)
@@ -675,13 +677,6 @@ class CustomRecorder(
         // Smooth gain to avoid pumping artifacts
         recordGain = (recordGain * (1.0f - recordGainSmoothing)) + (desiredGain * recordGainSmoothing)
 
-        // Log occasionally for diagnostics
-        val nowMs = android.os.SystemClock.uptimeMillis()
-        if (nowMs - lastRecordGainLogMs > 2000L) {
-            lastRecordGainLogMs = nowMs
-            Log.d(logFrom, "🔴 [CUSTOM_RECORDER] Audio gain: rms=$rms, peak=$peak, desiredGain=$desiredGain, appliedGain=$recordGain")
-        }
-
         val out = ByteArray(input.size)
         i = 0
         while (i + 1 < input.size) {
@@ -694,6 +689,42 @@ class CustomRecorder(
             out[i + 1] = ((scaled shr 8) and 0xFF).toByte()
             i += 2
         }
+        // #region agent log
+        val nowMs = android.os.SystemClock.uptimeMillis()
+        if (nowMs - lastRecordGainLogMs > 2000L) {
+            lastRecordGainLogMs = nowMs
+            var outSumSq = 0.0
+            var outPeak = 0
+            var outSamples = 0
+            var j = 0
+            while (j + 1 < out.size) {
+                val lo = out[j].toInt() and 0xFF
+                val hi = out[j + 1].toInt()
+                val s = (hi shl 8) or lo
+                val v = s.toShort().toInt()
+                val av = kotlin.math.abs(v)
+                if (av > outPeak) outPeak = av
+                outSumSq += (v * v).toDouble()
+                outSamples++
+                j += 2
+            }
+            val outRms = if (outSamples > 0) kotlin.math.sqrt(outSumSq / outSamples) else 0.0
+            Log.d(
+                logFrom,
+                "[AUDIO_DIAG] CustomRecorder gain: inputRms=${"%.1f".format(rms)} inputPeak=$peak " +
+                    "outputRms=${"%.1f".format(outRms)} outputPeak=$outPeak " +
+                    "desiredGain=${"%.2f".format(desiredGain)} appliedGain=${"%.2f".format(recordGain)} " +
+                    "targetRms=$recordTargetRms gainMax=$recordGainMax"
+            )
+            if (recordGain > 2.0f) {
+                Log.w(
+                    logFrom,
+                    "[AUDIO_DIAG] CustomRecorder: HIGH gain (${"%.2f".format(recordGain)}x) applied to CAMCORDER audio. " +
+                        "CAMCORDER is already hardware-processed; extra software gain may cause distortion."
+                )
+            }
+        }
+        // #endregion
         return out
     }
     

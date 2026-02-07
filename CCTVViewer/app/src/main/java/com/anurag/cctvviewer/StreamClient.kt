@@ -325,6 +325,10 @@ class StreamClient(
     @Volatile private var lastAcceptedWidth = 0
     @Volatile private var lastAcceptedHeight = 0
 
+    /** Set as soon as STREAM_ACCEPTED is parsed so UI can use for FIT transform before lastAccepted* or decoder format. */
+    @Volatile private var negotiatedVideoWidth = 0
+    @Volatile private var negotiatedVideoHeight = 0
+
     /**
      * Returns the last STREAM_ACCEPTED dimensions (server truth) if known.
      *
@@ -338,6 +342,17 @@ class StreamClient(
         val w = lastAcceptedWidth
         val h = lastAcceptedHeight
         return if (w > 0 && h > 0) (w to h) else null
+    }
+
+    /**
+     * Returns the last STREAM_ACCEPTED / negotiated video dimensions for UI use (e.g. TextureView FIT transform).
+     * Prefers negotiatedVideo* (set as soon as STREAM_ACCEPTED is parsed) so first frame can apply FIT before decoder reports format.
+     */
+    fun getAcceptedVideoDimensions(): Pair<Int, Int>? {
+        val nw = negotiatedVideoWidth
+        val nh = negotiatedVideoHeight
+        if (nw > 0 && nh > 0) return nw to nh
+        return getAcceptedDimsOrNull()
     }
 
     // Track the decoder's *configured* dimensions (what we passed to MediaCodec.configure()).
@@ -644,7 +659,7 @@ class StreamClient(
 
 
                 listen()
-            } catch (e: java.net.SocketTimeoutException) {
+            } catch (e: SocketTimeoutException) {
                 Log.w(logFrom, "[Stream Client] Connection timed out", e)
                 postError(mapExceptionToUserMessage(e, "connect"))
                 postState(ConnectionState.DISCONNECTED)
@@ -731,9 +746,12 @@ class StreamClient(
         // #endregion
         if (!appInBackground) return
         appInBackground = false
-        Log.d(logFrom, "[Stream Client] 🟢 [VIEWER] App foregrounded – reconnecting")
-        // Reuse existing reconnect path
-        connect()
+        if (autoReconnect) {
+            Log.d(logFrom, "[Stream Client] 🟢 [VIEWER] App foregrounded – reconnecting")
+            connect()
+        } else {
+            Log.d(logFrom, "[Stream Client] 🟢 [VIEWER] App foregrounded – skipping auto-reconnect (user disconnected)")
+        }
     }
 
     // (Removed setCropToFill) — scaling is always SCALE_TO_FIT.
@@ -1051,6 +1069,8 @@ class StreamClient(
                                 // New epoch: clear accepted dims until STREAM_ACCEPTED arrives.
                                 lastAcceptedWidth = 0
                                 lastAcceptedHeight = 0
+                                negotiatedVideoWidth = 0
+                                negotiatedVideoHeight = 0
                                 waitingForKeyframe = true
                                 postedFirstFrameRendered = false
                                 firstRenderAttemptUptimeMs = 0L
@@ -1160,14 +1180,14 @@ class StreamClient(
                             }
                             // Request keyframe immediately after receiving CSD to speed up decoder start
                             requestKeyframe("csd_received")
-                            } catch (e: java.net.SocketException) {
+                            } catch (e: SocketException) {
                                 // Connection reset or socket closed - break out of listen loop
                                 Log.w(logFrom, "[Stream Client] 🔴 [CSD] Socket error reading CSD data: ${e.message}")
                                 throw e // Re-throw to exit listen loop
                             } catch (e: Exception) {
                                 Log.w(logFrom, "[Stream Client] 🔴 [CSD] Error reading CSD data: ${e.message}", e)
                                 // For socket errors, exit the listen loop
-                                if (e is java.io.IOException) {
+                                if (e is IOException) {
                                     throw e
                                 }
                             }
@@ -1243,7 +1263,7 @@ class StreamClient(
                                     }
                                     // Ownership transferred to queues, do NOT recycle here.
                                     buffer = null 
-                                } catch (e: java.net.SocketException) {
+                                } catch (e: SocketException) {
                                     // Recycle buffer if read failed
                                     ByteArrayPool.recycle(buffer)
                                     buffer = null
@@ -1253,7 +1273,7 @@ class StreamClient(
                                     buffer = null
                                     throw t
                                 }
-                            } catch (e: java.net.SocketException) {
+                            } catch (e: SocketException) {
                                 // Connection reset or socket closed - break out of listen loop
                                 throw e
                             } catch (t: Throwable) {
@@ -1366,12 +1386,12 @@ class StreamClient(
                                         "⚠️ [RX OVERLOAD] Dropped non-key frame due to full decode queue (dropCount=$rxOverloadDropCount, size=$size, queueSize=${decodeQueue.size})"
                                     )
                                 }
-                            } catch (e: java.net.SocketException) {
+                            } catch (e: SocketException) {
                                 Log.w(logFrom, "[Stream Client] 🔴 [RX OVERLOAD] Socket error draining overloaded frame: ${e.message}")
                                 throw e
                             } catch (e: Exception) {
                                 Log.w(logFrom, "[Stream Client] 🔴 [RX OVERLOAD] Error draining overloaded frame: ${e.message}", e)
-                                if (e is java.io.IOException) throw e
+                                if (e is IOException) throw e
                             }
                             continue
                         }
@@ -1395,14 +1415,14 @@ class StreamClient(
                                 if (size > 100_000 || isKeyFrame) {
                                     Log.d(logFrom, "[Stream Client] 🔵 [FRAME DRAIN] Frame drained (decoding paused): size=$size, isKeyFrame=$isKeyFrame, decodeRunning=$decodeRunning")
                                 }
-                            } catch (e: java.net.SocketException) {
+                            } catch (e: SocketException) {
                                 // Connection reset or socket closed - break out of listen loop
                                 Log.w(logFrom, "[Stream Client] 🔴 [FRAME DRAIN] Socket error draining frame: ${e.message}")
                                 throw e // Re-throw to exit listen loop
                             } catch (e: Exception) {
                                 Log.w(logFrom, "[Stream Client] 🔴 [FRAME DRAIN] Error draining frame: ${e.message}", e)
                                 // For socket errors, exit the listen loop
-                                if (e is java.io.IOException) {
+                                if (e is IOException) {
                                     throw e
                                 }
                             }
@@ -1455,7 +1475,7 @@ class StreamClient(
                             } else {
                                 buffer = null // Ownership transferred to queue
                             }
-                        } catch (e: java.net.SocketException) {
+                        } catch (e: SocketException) {
                             if (buffer != null) ByteArrayPool.recycle(buffer)
                             throw e
                         } catch (t: Throwable) {
@@ -1506,6 +1526,8 @@ class StreamClient(
                             // New epoch: clear accepted dims; this STREAM_ACCEPTED will re-seed them at end.
                             lastAcceptedWidth = 0
                             lastAcceptedHeight = 0
+                            negotiatedVideoWidth = 0
+                            negotiatedVideoHeight = 0
                             // IMPORTANT:
                             // Do not start a decoder using stale csd0/csd1 from the previous epoch.
                             // Wait for the new epoch's CSD first, otherwise rotations (Option A) can go black.
@@ -1529,6 +1551,9 @@ class StreamClient(
                         }
                         
                         if (newWidth > 0 && newHeight > 0) {
+                            // Set early so getAcceptedVideoDimensions() is non-null before first frame (UI FIT transform).
+                            negotiatedVideoWidth = newWidth
+                            negotiatedVideoHeight = newHeight
                             // CRITICAL FIX: Immediately notify UI of video size.
                             // Fixes "Zoomed/Cropped" preview on devices (M30s) where decoder doesn't emit format change events.
                             postVideoSize(newWidth, newHeight)
@@ -2543,7 +2568,7 @@ class StreamClient(
                                     // CRITICAL FIX: Safe release with decoder re-check
                                     val codecForRelease = decoder ?: break
                                     if (codecForRelease !== codec) break
-                                    try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (e: IllegalStateException) { break }
+                                    try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (_: IllegalStateException) { break }
                                     break
                                 }
                                 val suppressUntil = nordCe4SuppressRenderUntilUptimeMs
@@ -2558,7 +2583,7 @@ class StreamClient(
                                     // CRITICAL FIX: Safe release with decoder re-check
                                     val codecForRelease = decoder ?: break
                                     if (codecForRelease !== codec) break
-                                    try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (e: IllegalStateException) { break }
+                                    try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (_: IllegalStateException) { break }
                                     break
                                 }
                                 val drops = nordCe4OutputWarmupDropsRemaining
@@ -2571,7 +2596,7 @@ class StreamClient(
                                     // CRITICAL FIX: Safe release with decoder re-check
                                     val codecForRelease = decoder ?: break
                                     if (codecForRelease !== codec) break
-                                    try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (e: IllegalStateException) { break }
+                                    try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (_: IllegalStateException) { break }
                                     break
                                 }
                             }
@@ -2587,7 +2612,7 @@ class StreamClient(
                                 // CRITICAL FIX: Safe release with decoder re-check
                                 val codecForRelease = decoder ?: break
                                 if (codecForRelease !== codec) break
-                                try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (e: IllegalStateException) { break }
+                                try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (_: IllegalStateException) { break }
                                 break
                             }
 
@@ -2600,7 +2625,7 @@ class StreamClient(
                                 // CRITICAL FIX: Safe release with decoder re-check
                                 val codecForRelease = decoder ?: break
                                 if (codecForRelease !== codec) break
-                                try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (e: IllegalStateException) { break }
+                                try { codecForRelease.releaseOutputBuffer(outputIndex, false) } catch (_: IllegalStateException) { break }
                                 break
                             }
 
@@ -3113,29 +3138,29 @@ class StreamClient(
         var offset = 0
         // Use synchronized access to prevent race conditions with closeSocket()
         val src = synchronized(inputLock) {
-            input ?: throw java.net.SocketException("Socket input not available")
+            input ?: throw SocketException("Socket input not available")
         }
         
         // Check if socket is still connected before reading
         val currentSocket = socket
         if (currentSocket == null || currentSocket.isClosed) {
-            throw java.net.SocketException("Socket is closed")
+            throw SocketException("Socket is closed")
         }
         
         try {
             while (offset < buffer.size) {
                 val read = src.read(buffer, offset, buffer.size - offset)
                 if (read < 0) {
-                    throw java.net.SocketException("Socket closed during read")
+                    throw SocketException("Socket closed during read")
                 }
                 offset += read
             }
-        } catch (e: java.net.SocketException) {
+        } catch (e: SocketException) {
             // Re-throw socket exceptions as-is (connection reset, closed, etc.)
             throw e
-        } catch (e: java.io.IOException) {
+        } catch (e: IOException) {
             // Wrap other IO exceptions as SocketException for consistent handling
-            throw java.net.SocketException("IO error during read: ${e.message}").apply {
+            throw SocketException("IO error during read: ${e.message}").apply {
                 initCause(e)
             }
         }
@@ -3156,29 +3181,29 @@ class StreamClient(
         var offset = 0
         // Use synchronized access to prevent race conditions with closeSocket()
         val src = synchronized(inputLock) {
-            input ?: throw java.net.SocketException("Socket input not available")
+            input ?: throw SocketException("Socket input not available")
         }
         
         // Check if socket is still connected before reading
         val currentSocket = socket
         if (currentSocket == null || currentSocket.isClosed) {
-            throw java.net.SocketException("Socket is closed")
+            throw SocketException("Socket is closed")
         }
         
         try {
             while (offset < length) {
                 val read = src.read(buffer, offset, length - offset)
                 if (read < 0) {
-                    throw java.net.SocketException("Socket closed during read")
+                    throw SocketException("Socket closed during read")
                 }
                 offset += read
             }
-        } catch (e: java.net.SocketException) {
+        } catch (e: SocketException) {
             // Re-throw socket exceptions as-is (connection reset, closed, etc.)
             throw e
-        } catch (e: java.io.IOException) {
+        } catch (e: IOException) {
             // Wrap other IO exceptions as SocketException for consistent handling
-            throw java.net.SocketException("IO error during read: ${e.message}").apply {
+            throw SocketException("IO error during read: ${e.message}").apply {
                 initCause(e)
             }
         }
@@ -3211,11 +3236,11 @@ class StreamClient(
                 if (b != '\r'.code) out.append(b.toChar())
             }
             return out.toString()
-        } catch (e: java.net.SocketException) {
+        } catch (e: SocketException) {
             // Connection reset or socket closed - return null to signal end of stream
             Log.d(logFrom, "🔵 [SOCKET] Socket exception in readLineFromSocket: ${e.message}")
             return null
-        } catch (e: java.io.IOException) {
+        } catch (e: IOException) {
             // Other IO errors - return null to signal end of stream
             Log.d(logFrom, "🔵 [SOCKET] IO exception in readLineFromSocket: ${e.message}")
             return null

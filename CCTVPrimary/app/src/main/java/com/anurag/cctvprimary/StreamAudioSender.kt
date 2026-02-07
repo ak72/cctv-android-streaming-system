@@ -16,6 +16,8 @@ import kotlin.math.tanh
  * Applies volume boost, quality improvements, and AAC compression before transmission.
  * Reduces bandwidth from ~768 kbps (raw PCM) to ~64 kbps (AAC) for better network performance.
  */
+
+private const val STREAM_DIAG_INTERVAL_MS = 2000L
 class StreamAudioSender(
     private val streamServer: StreamServer
 ) : AudioSourceEngine.AudioListener {
@@ -41,6 +43,10 @@ class StreamAudioSender(
     // ADTS header for AAC (7 bytes)
     private var adtsHeader: ByteArray? = null
     private var adtsHeaderReady = false
+
+    // Diagnostic: throttled stats for audio pipeline debugging
+    private var lastStreamDiagMs: Long = 0L
+
     
     init {
         setupAacEncoder()
@@ -115,7 +121,43 @@ class StreamAudioSender(
             
             i += 2
         }
-        
+        // #region agent log
+        val nowMs = android.os.SystemClock.uptimeMillis()
+        if (nowMs - lastStreamDiagMs >= STREAM_DIAG_INTERVAL_MS) {
+            lastStreamDiagMs = nowMs
+            var inSumSq = 0.0
+            var inPeak = 0
+            var outSumSq = 0.0
+            var outPeak = 0
+            var samples = 0
+            var j = 0
+            while (j + 1 < input.size) {
+                val inLo = input[j].toInt() and 0xFF
+                val inHi = input[j + 1].toInt()
+                val inS = (inHi shl 8) or inLo
+                val inV = inS.toShort().toInt()
+                val inAv = kotlin.math.abs(inV)
+                if (inAv > inPeak) inPeak = inAv
+                inSumSq += (inV * inV).toDouble()
+                val outLo = output[j].toInt() and 0xFF
+                val outHi = output[j + 1].toInt()
+                val outS = (outHi shl 8) or outLo
+                val outV = outS.toShort().toInt()
+                val outAv = kotlin.math.abs(outV)
+                if (outAv > outPeak) outPeak = outAv
+                outSumSq += (outV * outV).toDouble()
+                samples++
+                j += 2
+            }
+            val inRms = if (samples > 0) kotlin.math.sqrt(inSumSq / samples) else 0.0
+            val outRms = if (samples > 0) kotlin.math.sqrt(outSumSq / samples) else 0.0
+            Log.d(
+                logFrom,
+                "[AUDIO_DIAG] StreamAudioSender: inputRms=${"%.1f".format(inRms)} inputPeak=$inPeak " +
+                    "outputRms=${"%.1f".format(outRms)} outputPeak=$outPeak volumeGain=$volumeGain"
+            )
+        }
+        // #endregion
         return output
     }
     

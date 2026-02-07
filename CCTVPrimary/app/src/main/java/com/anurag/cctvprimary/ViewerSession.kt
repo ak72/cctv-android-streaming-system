@@ -42,11 +42,13 @@ class ViewerSession(
         /** Protocol stream state codes (authoritative; viewer must obey). 1=ACTIVE, 2=RECONFIGURING, 3=PAUSED, 4=STOPPED */
         private const val STREAM_STATE_ACTIVE = 1
         private const val STREAM_STATE_RECONFIGURING = 2
+        @Suppress("unused") // Reserved for future PAUSED state (protocol defines 3=PAUSED)
         private const val STREAM_STATE_PAUSED = 3
         private const val STREAM_STATE_STOPPED = 4
     }
 
 
+    /** Session lifecycle states; allowed transitions are defined in Docs/SESSION_LIFECYCLE.md. */
     enum class StreamState {
         CONNECTING, DISCONNECTED, AUTHENTICATED, STREAMING, RECONFIGURING
     }
@@ -71,7 +73,7 @@ class ViewerSession(
     private var pendingConfig: StreamConfig? = null
     var sessionId: String = java.util.UUID.randomUUID().toString()
 
-    /** Negotiated protocol version from HELLO. 2 = text line + payload; 3 = binary framed [header][payload] for video. */
+    /** Negotiated protocol version from HELLO. 2 = text line + payload; 3 = binary framed 'header payload' for video. */
     @Volatile
     private var protocolVersion: Int = 2
 
@@ -129,7 +131,10 @@ class ViewerSession(
             frameSeq.set(0L)
         }
         // New epoch: we must send ACTIVE again after first keyframe of this epoch.
-        if (epoch != prevEpoch) activeSentForThisEpoch = false
+        if (epoch != prevEpoch) {
+            reconfigCount.incrementAndGet()
+            activeSentForThisEpoch = false
+        }
     }
 
     // --- Heartbeat ---
@@ -177,6 +182,15 @@ class ViewerSession(
 
     @Volatile
     private var senderRunning = false
+
+    /** Session start time for disconnect summary. */
+    private val sessionStartMs = System.currentTimeMillis()
+    /** Frames successfully written to socket (sender thread). */
+    private val framesSentCount = AtomicLong(0L)
+    /** Frames dropped at this session (not sent: early return or per-session queue shed). */
+    private val framesDroppedCount = AtomicLong(0L)
+    /** Number of stream epoch changes (reconfigs) for this session. */
+    private val reconfigCount = AtomicLong(0L)
     
     // Use shared session pool to cap total session threads (StreamingExecutors.sessionPool)
     private val sessionPool: ExecutorService get() = StreamingExecutors.sessionPool
@@ -389,6 +403,7 @@ class ViewerSession(
      }*/
     fun enqueueFrame(frame: EncodedFrame) {
         if (!authenticated.get()) {
+            framesDroppedCount.incrementAndGet()
             Log.d(TAG, "[VIEWER SESSION] dropping frame — not active (authenticated=${authenticated.get()})")
             return
         }
@@ -396,16 +411,19 @@ class ViewerSession(
         // Accept frames in both STREAMING and RECONFIGURING. RECONFIGURING exits only when a keyframe is sent;
         // if we dropped frames here during RECONFIGURING, no keyframe would ever reach the sender → deadlock.
         if (state != StreamState.STREAMING && state != StreamState.RECONFIGURING) {
+            framesDroppedCount.incrementAndGet()
             Log.d(TAG, "[VIEWER SESSION] dropping frame — state=$state")
             return
         }
 
         if (frameQueue.remainingCapacity() == 0) {
+            framesDroppedCount.incrementAndGet()
             Log.w(TAG, "🔴 [VIEWER SESSION] enqueueFrame called but session is DISCONNECTED - dropping frame")
             return
         }
         // Per-session drop policy: if this viewer's queue is already backed up, drop non-keyframes until next keyframe (favors freshness over completeness).
         if (!frame.isKeyFrame && state == StreamState.STREAMING && frameQueue.size >= DROP_POLICY_QUEUE_THRESHOLD) {
+            framesDroppedCount.incrementAndGet()
             return
         }
         // Under load (e.g. motion), never silently drop keyframes; it causes visible decoder artifacts
@@ -423,6 +441,7 @@ class ViewerSession(
         }
         if (!frameQueue.offer(frame)) {
             // Drop oldest to keep latency bounded, then enqueue.
+            framesDroppedCount.incrementAndGet()
             frameQueue.poll()
             frameQueue.offer(frame)
         }
@@ -536,6 +555,7 @@ class ViewerSession(
                                 out.write(frame.data)
                                 out.flush()
                             }
+                            framesSentCount.incrementAndGet()
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "[VIEWER SESSION] Frame send error: ${e.message}")
@@ -595,6 +615,15 @@ class ViewerSession(
         // #endregion
         if (!stateWrapper.compareAndSet(false, true)) return // Idempotent check
 
+        val lastState = state
+        val durationMs = System.currentTimeMillis() - sessionStartMs
+        val sent = framesSentCount.get()
+        val dropped = framesDroppedCount.get()
+        val reconfigs = reconfigCount.get()
+        Log.i(
+            TAG,
+            "[VIEWER SESSION] 📊 Disconnect summary: sessionId=$sessionId, durationMs=$durationMs, lastState=$lastState, framesSent=$sent, framesDropped=$dropped, reconfigs=$reconfigs"
+        )
         Log.d(TAG, "[VIEWER SESSION] Closing session ${socket.inetAddress.hostAddress}")
         state = StreamState.DISCONNECTED
         senderRunning = false
@@ -713,8 +742,7 @@ class ViewerSession(
      * Mandatory terminal state. Funneled through sender thread like all state.
      */
     fun sendStreamStateStopped() {
-        val epoch = streamEpoch
-        sessionPool.execute { streamStateQueue.offer(Pair(STREAM_STATE_STOPPED, epoch)) }
+        scheduleStreamState(STREAM_STATE_STOPPED, streamEpoch)
     }
 
     fun sendCsd(sps: ByteArray, pps: ByteArray) {

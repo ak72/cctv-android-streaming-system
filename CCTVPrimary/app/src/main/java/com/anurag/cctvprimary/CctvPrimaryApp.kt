@@ -63,7 +63,7 @@ class CctvPrimaryApp : Application() {
         try {
             val am = getSystemService(ActivityManager::class.java) ?: return
             val exits = am.getHistoricalProcessExitReasons(packageName, 0, 5)
-            if (exits.isNullOrEmpty()) return
+            if (exits.isEmpty()) return
 
             // Log newest first; this is what we’ll use to debug “soft” crashes / sudden process death.
             exits.forEachIndexed { idx, e ->

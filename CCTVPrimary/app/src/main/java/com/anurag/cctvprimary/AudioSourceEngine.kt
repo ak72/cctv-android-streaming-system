@@ -17,6 +17,8 @@ import java.util.concurrent.CopyOnWriteArrayList
  * Thread-safe singleton pattern ensures only one AudioRecord instance exists at a time.
  */
 private const val  TAG = "AudioSourceEngine"
+// Diagnostic: throttled capture stats (every 2s) for audio pipeline debugging
+private const val CAPTURE_DIAG_INTERVAL_MS = 2000L
 class AudioSourceEngine private constructor() {
     
     companion object {
@@ -49,6 +51,11 @@ class AudioSourceEngine private constructor() {
     // Track currently active AudioRecord source + mode (for dynamic switching)
     @Volatile private var currentAudioSource: Int = -1
     @Volatile private var currentRecordingActive: Boolean = false
+    @Volatile private var currentStreamingAndRecording: Boolean = false
+
+    // Diagnostic: throttled capture stats (every 2s) for audio pipeline debugging
+    private var lastCaptureDiagMs: Long = 0L
+    //private const val CAPTURE_DIAG_INTERVAL_MS = 2000L
 
     /**
      * Convert MediaRecorder.AudioSource int to a readable label for logs.
@@ -206,30 +213,32 @@ class AudioSourceEngine private constructor() {
     /**
      * Restart capture if our current AudioRecord source doesn't match the current mode.
      *
-     * Why: streaming usually uses VOICE_COMMUNICATION (often quiet/processed for VoIP),
-     * but recording needs CAMCORDER/UNPROCESSED for better volume/clarity.
-     * If streaming starts first, AudioRecord is created in streaming mode and won't be recreated unless we do it.
+     * Modes: streaming-only (VOICE_COMMUNICATION+AEC), streaming+recording (VOICE_COMMUNICATION+AEC),
+     * recording-only (CAMCORDER, no AEC). Restart when switching between recording-only and streaming+recording.
      */
     private fun maybeRestartForModeChangeLocked() {
         try {
             val shouldBeRecordingActive = recordingRefCount > 0
+            val shouldBeStreamingAndRecording = streamingRefCount > 0 && recordingRefCount > 0
             if (!isRunning) {
-                // Not running yet; startCaptureIfNeeded() will pick the correct source.
                 currentRecordingActive = shouldBeRecordingActive
+                currentStreamingAndRecording = shouldBeStreamingAndRecording
                 return
             }
 
-            // If mode changed (streaming-only -> recording or recording -> streaming-only), restart capture.
-            if (currentRecordingActive != shouldBeRecordingActive) {
+            val modeChanged = currentRecordingActive != shouldBeRecordingActive ||
+                currentStreamingAndRecording != shouldBeStreamingAndRecording
+            if (modeChanged) {
                 Log.w(
                     TAG,
                     "Audio capture mode change detected. Restarting AudioRecord. " +
-                        "currentRecordingActive=$currentRecordingActive -> shouldBeRecordingActive=$shouldBeRecordingActive, " +
+                        "recordingActive=$currentRecordingActive->$shouldBeRecordingActive, " +
+                        "streamingAndRecording=$currentStreamingAndRecording->$shouldBeStreamingAndRecording, " +
                         "currentSource=$currentAudioSource"
                 )
-                // Force stop without changing listeners/refcounts, then restart.
                 forceRestartCaptureLocked()
                 currentRecordingActive = shouldBeRecordingActive
+                currentStreamingAndRecording = shouldBeStreamingAndRecording
                 startCaptureIfNeeded()
             }
         } catch (e: Exception) {
@@ -283,17 +292,21 @@ class AudioSourceEngine private constructor() {
                 val bufferSize = minBuf.coerceAtLeast(1920 * 3)
 
                 // CRITICAL: Audio source selection affects volume/processing a lot.
-                // - VOICE_COMMUNICATION can sound low/processed on many devices (AGC/NS/AEC tuning for VoIP).
-                // - CAMCORDER is typically better for video recording volume.
-                // - UNPROCESSED is best quality if supported (may be ignored by OEM).
+                // - When both streaming and recording: use VOICE_COMMUNICATION so AEC cancels PTT playback (avoids echo in recording).
+                // - When recording-only: use CAMCORDER for better video recording volume.
+                // - When streaming-only: use VOICE_COMMUNICATION for VoIP.
                 val isRecordingActive = recordingRefCount > 0
-                val preferredSources: IntArray = if (isRecordingActive) {
+                val isStreamingAndRecording = streamingRefCount > 0 && recordingRefCount > 0
+                val preferredSources: IntArray = if (isStreamingAndRecording) {
+                    // Streaming + recording: prefer VOICE_COMMUNICATION (AEC cancels Talkback/PTT echo)
                     intArrayOf(
-                        // Recording priority:
-                        // 1) CAMCORDER: best default gain/tuning for video recording on most OEMs
-                        // 2) MIC: generic fallback
-                        // 3) VOICE_RECOGNITION: another reasonable fallback
-                        // 4) UNPROCESSED: often too quiet on many devices; keep last
+                        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                        MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                        MediaRecorder.AudioSource.MIC
+                    )
+                } else if (isRecordingActive) {
+                    // Recording-only: CAMCORDER for best video recording volume (no PTT echo)
+                    intArrayOf(
                         MediaRecorder.AudioSource.CAMCORDER,
                         MediaRecorder.AudioSource.MIC,
                         MediaRecorder.AudioSource.VOICE_RECOGNITION,
@@ -327,17 +340,18 @@ class AudioSourceEngine private constructor() {
                 }
 
                 if (created == null || chosenSource == null) {
-                    Log.e(TAG, "Failed to create AudioRecord with any source (recordingActive=$isRecordingActive)")
+                    Log.e(TAG, "Failed to create AudioRecord with any source (recordingActive=$isRecordingActive, streamingAndRecording=$isStreamingAndRecording)")
                     return
                 }
 
                 audioRecord = created
                 currentAudioSource = chosenSource
                 currentRecordingActive = isRecordingActive
+                currentStreamingAndRecording = isStreamingAndRecording
                 Log.d(
                     TAG,
                     "AudioRecord created: source=$chosenSource/${audioSourceLabel(chosenSource)} " +
-                        "(recordingActive=$isRecordingActive), bufferSize=$bufferSize"
+                        "(recordingActive=$isRecordingActive, streamingAndRecording=$isStreamingAndRecording), bufferSize=$bufferSize"
                 )
 
                 // Diagnostics: UNPROCESSED is notoriously low-gain on many devices.
@@ -352,32 +366,38 @@ class AudioSourceEngine private constructor() {
                 }
                 
                 val recorder = audioRecord ?: return
-                
-                // Enable hardware processing
-                // Note: for recording sources like UNPROCESSED/CAMCORDER, OEM processing is often better left alone.
-                // Keep effects enabled only in streaming mode.
-                if (!isRecordingActive && android.media.audiofx.NoiseSuppressor.isAvailable()) {
+
+                // Enable AEC/AGC/NS when streaming is active (including streaming+recording) so PTT/Talkback
+                // playback is cancelled. When recording-only, effects stay off (CAMCORDER path).
+                val useEffects = streamingRefCount > 0
+                if (useEffects && android.media.audiofx.NoiseSuppressor.isAvailable()) {
                     try {
                         android.media.audiofx.NoiseSuppressor.create(recorder.audioSessionId).enabled = true
                     } catch (e: Throwable) {
                         Log.w(TAG, "Failed to enable NoiseSuppressor", e)
                     }
                 }
-                
-                if (!isRecordingActive && android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
+
+                if (useEffects && android.media.audiofx.AcousticEchoCanceler.isAvailable()) {
                     try {
                         android.media.audiofx.AcousticEchoCanceler.create(recorder.audioSessionId).enabled = true
+                        Log.d(TAG, "[AUDIO_DIAG] AcousticEchoCanceler enabled (streaming/streaming+recording)")
                     } catch (e: Throwable) {
                         Log.w(TAG, "Failed to enable AcousticEchoCanceler", e)
                     }
+                } else if (!useEffects) {
+                    Log.d(TAG, "[AUDIO_DIAG] AcousticEchoCanceler NOT enabled (recording-only, source=${audioSourceLabel(chosenSource)})")
                 }
-                
-                if (!isRecordingActive && android.media.audiofx.AutomaticGainControl.isAvailable()) {
+
+                if (useEffects && android.media.audiofx.AutomaticGainControl.isAvailable()) {
                     try {
                         android.media.audiofx.AutomaticGainControl.create(recorder.audioSessionId).enabled = true
+                        Log.d(TAG, "[AUDIO_DIAG] AutomaticGainControl enabled (streaming/streaming+recording)")
                     } catch (e: Throwable) {
                         Log.w(TAG, "Failed to enable AutomaticGainControl", e)
                     }
+                } else if (!useEffects) {
+                    Log.d(TAG, "[AUDIO_DIAG] AutomaticGainControl NOT enabled (recording-only)")
                 }
                 
                 recorder.startRecording()
@@ -452,7 +472,35 @@ class AudioSourceEngine private constructor() {
                 val read = recorder.read(buffer, 0, buffer.size)
                 if (read > 0) {
                     val data = buffer.copyOfRange(0, read)
-                    
+                    // #region agent log
+                    val nowMs = android.os.SystemClock.uptimeMillis()
+                    if (nowMs - lastCaptureDiagMs >= CAPTURE_DIAG_INTERVAL_MS) {
+                        lastCaptureDiagMs = nowMs
+                        var sumSq = 0.0
+                        var peak = 0
+                        var samples = 0
+                        var idx = 0
+                        while (idx + 1 < data.size) {
+                            val lo = data[idx].toInt() and 0xFF
+                            val hi = data[idx + 1].toInt()
+                            val s = (hi shl 8) or lo
+                            val v = s.toShort().toInt()
+                            val av = kotlin.math.abs(v)
+                            if (av > peak) peak = av
+                            sumSq += (v * v).toDouble()
+                            samples++
+                            idx += 2
+                        }
+                        val rms = if (samples > 0) kotlin.math.sqrt(sumSq / samples) else 0.0
+                        val src = currentAudioSource
+                        Log.d(
+                            TAG,
+                            "[AUDIO_DIAG] capture: rms=${"%.1f".format(rms)} peak=$peak samples=$samples " +
+                                "source=${audioSourceLabel(src)} recordingActive=$currentRecordingActive " +
+                                "listeners=${listeners.size} streamingRef=$streamingRefCount recordingRef=$recordingRefCount"
+                        )
+                    }
+                    // #endregion
                     // Multicast to all listeners
                     listeners.forEach { listener ->
                         try {

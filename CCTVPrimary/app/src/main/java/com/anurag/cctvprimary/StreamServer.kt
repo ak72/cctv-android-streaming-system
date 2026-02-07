@@ -5,7 +5,6 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArraySet
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicLong
 enum class RemoteCommand {
@@ -645,8 +644,7 @@ class StreamServer(
                         Log.d(logFrom, "🔵 [STREAM SERVER] Sender thread waiting for frame from FrameBus (queueSize=0, sessions=$sessionsCount) - waiting for encoder to produce frames...")
                     }
                     // Use timeout so stop() (senderRunning=false) interrupts the drain cleanly; take() would block forever.
-                    var latest = frameBus.pollWithTimeout(500L)
-                    if (latest == null) continue
+                    var latest = frameBus.pollWithTimeout(500L) ?: continue
                     var latestKey: EncodedFrame? = if (latest.isKeyFrame) latest else null
                     var framesDrained = 1
                     while (true) {

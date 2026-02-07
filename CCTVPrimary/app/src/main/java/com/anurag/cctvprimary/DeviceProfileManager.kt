@@ -47,11 +47,11 @@ internal object DeviceProfileManager {
         // - YUV_420_888 (ImageAnalysis for ByteBuffer + CustomRecorder)
         // - MediaRecorder sizes (best-effort; if empty, ignore)
         val candidates = run {
-            val base = arrayListOf<List<Size>>(caps.previewSizes, caps.yuvSizes)
+            val base = arrayListOf(caps.previewSizes, caps.yuvSizes)
             if (caps.recorderSizes.isNotEmpty()) base.add(caps.recorderSizes)
             SizeSelector.intersect4by3Portrait(*base.toTypedArray())
         }
-        val relaxedCandidates = if (candidates.isNotEmpty()) candidates else SizeSelector.intersect4by3Portrait(caps.previewSizes, caps.yuvSizes)
+        val relaxedCandidates = candidates.ifEmpty { SizeSelector.intersect4by3Portrait(caps.previewSizes, caps.yuvSizes) }
         val size1080 = SizeSelector.pickBestAtOrBelow(relaxedCandidates, 1080, 1440)
         val size720 = SizeSelector.pickBestAtOrBelow(relaxedCandidates, 720, 960)
         val size480 = SizeSelector.pickBestAtOrBelow(relaxedCandidates, 480, 640)
