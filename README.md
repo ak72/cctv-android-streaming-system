@@ -52,17 +52,16 @@ The system follows a **Client–Server** model over **TCP/IP**.
 - **Server**: `CCTVPrimary` (the camera device)
 - **Client**: `CCTVViewer` (the display device)
 
-```mermaid
 graph LR
-    subgraph Primary Device [CCTVPrimary]
-        Camera[CameraX] --> Encoder[VideoEncoder H.264]
-        Mic[Microphone] --> AudioEngine[AudioSourceEngine]
-        Encoder --> StreamServer[StreamServer + FrameBus]
-        AudioEngine --> StreamAudioSender[StreamAudioSender AAC]
-        StreamAudioSender --> StreamServer
-        AudioEngine --> Recorder[CustomRecorder]
-        StreamServer --> Playback[AudioTrack Talkback]
-    end
+subgraph Primary Device [CCTVPrimary]
+Camera[CameraX] --> Encoder[VideoEncoder H.264]
+Mic[Microphone] --> AudioEngine[AudioSourceEngine]
+Encoder --> StreamServer[StreamServer + FrameBus]
+AudioEngine --> StreamAudioSender[StreamAudioSender AAC]
+StreamAudioSender --> StreamServer
+AudioEngine --> Recorder[CustomRecorder]
+StreamServer --> Playback[AudioTrack Talkback]
+end
 
     subgraph Viewer Device [CCTVViewer]
         StreamClient[StreamClient TCP] --> Decoder[MediaCodec H.264]
@@ -72,9 +71,6 @@ graph LR
     end
 
     StreamServer <==>|TCP Socket (Video/Audio/Control)| StreamClient
-```
-
----
 
 ## 2. CCTVPrimary (Server) Internals
 
