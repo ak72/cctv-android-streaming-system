@@ -116,6 +116,10 @@ class CameraForegroundService : LifecycleService() {
     private val audioSourceEngine = AudioSourceEngine.getInstance()
     private var streamAudioSender: StreamAudioSender? = null
 
+    /* -------- FGS policy (see Docs/FGS_POLICY.md) -------- */
+    @Volatile
+    private var fgsMicEscalated = false
+
     /* -------- Audio Talkback -------- */
     @Volatile
     private var talkbackTrack: android.media.AudioTrack? = null
@@ -773,6 +777,10 @@ class CameraForegroundService : LifecycleService() {
 
         // Initialize AudioSourceEngine with context
         audioSourceEngine.setContext(this)
+        // FGS policy: escalate to CAMERA|MICROPHONE when mic capture starts (streaming/recording)
+        audioSourceEngine.onMicCaptureAboutToStart = {
+            Handler(Looper.getMainLooper()).post { ensureMicFgsIfNeeded() }
+        }
 
         powerManager = getSystemService(POWER_SERVICE) as PowerManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -781,25 +789,18 @@ class CameraForegroundService : LifecycleService() {
 
 
         Log.d(logFrom, "CameraForegroundService created")
-        // Foreground service start (Android 14+/targetSdk 34+ enforcement):
-        // If we claim microphone FGS type without meeting eligibility + permissions, Android throws
-        // a SecurityException and the process crashes. Video streaming must remain stable, so we
-        // start as CAMERA-only here.
-        //
-        // Audio/talkback remains optional; it can be handled separately with an explicit mic-FGS
-        // (only after user action + permission checks) if needed.
+        // FGS policy (Docs/FGS_POLICY.md): start CAMERA-only; escalate to CAMERA|MICROPHONE when mic capture starts.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                // FOREGROUND_SERVICE_TYPE_CAMERA requires API 30 (R)
                 @Suppress("InlinedApi") startForeground(
                     NOTIFICATION_ID,
                     createNotification(),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
                 )
-                Log.d(logFrom, "✅ Foreground service started with type=CAMERA")
+                Log.d(logFrom, "[FGS] type=CAMERA started")
             } else {
                 startForeground(NOTIFICATION_ID, createNotification())
-                Log.d(logFrom, "✅ Foreground service started (legacy, no type)")
+                Log.d(logFrom, "[FGS] type=legacy (no type) started")
             }
         } catch (se: SecurityException) {
             Log.e(
@@ -997,6 +998,7 @@ class CameraForegroundService : LifecycleService() {
         }
         stopTalkback()
         stopStreamingAudio()
+        audioSourceEngine.onMicCaptureAboutToStart = null
         // Do not shut down cameraExecutor/analysisExecutor — they are shared (StreamingExecutors)
         stopEncoder()
         try {
@@ -3298,28 +3300,26 @@ class CameraForegroundService : LifecycleService() {
 
     fun isUsingFrontCamera(): Boolean = useFrontCamera
 
+    private companion object {
+        private const val GENERATE_UNIQUE_FILENAME_MAX_ATTEMPTS = 100
+    }
+
     /**
      * Generate a unique filename that doesn't exist yet.
      * When file rotation is disabled, we must ensure each recording creates a new file.
      * This function appends a counter to the base name if the file already exists.
      *
+     * Bounded: max 100 attempts; falls back to timestamp+UUID if exhausted (avoids infinite loop).
+     *
      * @param baseName Base filename without extension (e.g., "cctv_1234567890")
      * @return Unique filename that doesn't exist (e.g., "cctv_1234567890", "cctv_1234567890_1", etc.)
      */
     private fun generateUniqueFilename(baseName: String): String {
-        // For MediaStore, we need to check if DISPLAY_NAME exists in the database
-        // However, DISPLAY_NAME doesn't include extension in MediaStore, so we check without extension
         val resolver = contentResolver
-        /* Disabled here because they are calculated inside the loop
-        val selection =
-             "${MediaStore.Video.Media.DISPLAY_NAME} = ? AND ${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?"
-         val args = arrayOf(baseName, "%$videoRelativePath%")
- */
         var counter = 0
         var uniqueName = baseName
 
-        while (true) {
-            // Check if this filename exists in MediaStore
+        while (counter < GENERATE_UNIQUE_FILENAME_MAX_ATTEMPTS) {
             val querySelection =
                 "${MediaStore.Video.Media.DISPLAY_NAME} = ? AND ${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?"
             val queryArgs = arrayOf(uniqueName, "%$videoRelativePath%")
@@ -3335,11 +3335,9 @@ class CameraForegroundService : LifecycleService() {
             cursor?.close()
 
             if (!exists) {
-                // Also check if physical file exists (for fallback location)
                 val videoDir = File(getExternalFilesDir(null), "Videos")
                 val fallbackFile = File(videoDir, "$uniqueName.mp4")
                 if (!fallbackFile.exists()) {
-                    // Filename is unique
                     if (counter > 0) {
                         Log.d(
                             logFrom,
@@ -3350,11 +3348,18 @@ class CameraForegroundService : LifecycleService() {
                 }
             }
 
-            // Filename exists, try with counter suffix
             counter++
             uniqueName = "${baseName}_$counter"
-            Log.d(logFrom, "🔴 [RECORDING] Filename $baseName exists, trying: $uniqueName")
+            if (counter <= 3) Log.d(logFrom, "🔴 [RECORDING] Filename exists, trying: $uniqueName")
         }
+
+        // Fallback: timestamp + UUID to guarantee uniqueness; log telemetry
+        val fallback = "${baseName}_${java.util.UUID.randomUUID().toString().take(8)}"
+        Log.w(
+            logFrom,
+            "🔴 [RECORDING] generateUniqueFilename exhausted after $GENERATE_UNIQUE_FILENAME_MAX_ATTEMPTS attempts; using fallback: $fallback"
+        )
+        return fallback
     }
 
     private fun enforceStorageLimit() {
@@ -3434,6 +3439,33 @@ class CameraForegroundService : LifecycleService() {
 
     private fun persistState() {
         prefs.edit { putString("service_state", serviceState.name) }
+    }
+
+    /**
+     * Escalate FGS type to CAMERA|MICROPHONE when mic capture is active and RECORD_AUDIO is granted.
+     * Called from onMicCaptureAboutToStart callback (posted to main). See Docs/FGS_POLICY.md.
+     */
+    private fun ensureMicFgsIfNeeded() {
+        if (fgsMicEscalated) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val (streaming, recording) = audioSourceEngine.getRefCounts()
+        if (streaming == 0 && recording == 0) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.w(logFrom, "[FGS] escalation skipped (RECORD_AUDIO not granted)")
+            return
+        }
+        try {
+            @Suppress("InlinedApi")
+            val combinedType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            startForeground(NOTIFICATION_ID, createNotification(), combinedType)
+            fgsMicEscalated = true
+            Log.d(logFrom, "[FGS] type=CAMERA -> CAMERA|MICROPHONE (reason: mic_capture_started)")
+        } catch (se: SecurityException) {
+            Log.e(logFrom, "[FGS] escalation failed (SecurityException)", se)
+        } catch (t: Throwable) {
+            Log.e(logFrom, "[FGS] escalation failed", t)
+        }
     }
 
     @SuppressLint("ObsoleteSdkInt")

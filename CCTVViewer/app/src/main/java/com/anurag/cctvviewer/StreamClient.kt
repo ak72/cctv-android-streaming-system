@@ -13,6 +13,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import android.media.AudioTrack
 import android.media.AudioFormat
@@ -149,6 +150,7 @@ class StreamClient(
     // Also helps diagnose "video not visible" by distinguishing "no frames received" vs "frames decoded but not visible".
     @Volatile private var connectedUptimeMs: Long = 0L
     @Volatile private var lastPongUptimeMs: Long = 0L
+    @Volatile private var lastPongLogUptimeMs: Long = 0L
     @Volatile private var lastFrameRxUptimeMs: Long = 0L
     @Volatile private var lastFrameRenderUptimeMs: Long = 0L
     @Volatile private var lastAudioDownRxUptimeMs: Long = 0L
@@ -866,7 +868,7 @@ class StreamClient(
                     // Try to recover by skipping this corrupted line and continuing
                     continue
                 }
-                Log.d(logFrom, " 🔵 [SOCKET] Received line from server: ${line.take(50)}${if (line.length > 50) "..." else ""}")
+                if (!line.startsWith("FRAME|")) Log.d(logFrom, "🔵 [SOCKET] ${line.take(80)}${if (line.length > 80) "..." else ""}")
                 when {
                     line.startsWith("AUTH_CHALLENGE|") -> {
                         val params = parseParams(line)
@@ -948,10 +950,6 @@ class StreamClient(
                         val nowUptimeMs = android.os.SystemClock.uptimeMillis()
                         val sinceLastPong = if (lastPongUptimeMs > 0L) (nowUptimeMs - lastPongUptimeMs) else Long.MAX_VALUE
                         lastPongUptimeMs = nowUptimeMs
-                        // CRITICAL DIAGNOSTIC: Log PONG receipt to help diagnose heartbeat issues
-                        Log.d(logFrom, "[Stream Client] 🔵 [HEARTBEAT] PONG received: sinceLastPong=${sinceLastPong}ms, state=$currentState")
-                        // Heartbeat ack (Primary uses this to keep the session alive).
-                        // If it contains timestamps, use it to estimate server<->client clock offset.
                         if (line.startsWith("PONG|")) {
                             val p = parseParams(line)
                             val clientTs = p["tsMs"]?.toLongOrNull()
@@ -959,11 +957,12 @@ class StreamClient(
                             if (clientTs != null && srvMs != null) {
                                 val nowMs = System.currentTimeMillis()
                                 val rttMs = (nowMs - clientTs).coerceAtLeast(0L)
-                                // Estimate: server time at client receive ~= srvMs + rtt/2
-                                val estSrvAtNow = srvMs + (rttMs / 2.0)
-                                clockOffsetMs = estSrvAtNow - nowMs.toDouble()
+                                clockOffsetMs = srvMs + (rttMs / 2.0) - nowMs.toDouble()
                                 clockSynced = true
-                                Log.d(logFrom, "[Stream Client] 🔵 [HEARTBEAT] PONG with timestamps: rtt=${rttMs}ms, clockOffset=${clockOffsetMs}ms")
+                                if (nowUptimeMs - lastPongLogUptimeMs >= 10_000L) {
+                                    lastPongLogUptimeMs = nowUptimeMs
+                                    Log.d(logFrom, "[Stream Client] 🔵 [HEARTBEAT] PONG rtt=${rttMs}ms state=$currentState")
+                                }
                             }
                         }
                     }
@@ -1286,7 +1285,6 @@ class StreamClient(
                     }
 
                     line.startsWith("FRAME|") -> {
-                        Log.d(logFrom, "[Stream Client] [STREAM CLIENT] 🔵 [FRAME RECEIVED] ✅ FRAME| message matched and received: $line")
                         val params = parseParams(line)
                         val msgEpoch = params["epoch"]?.toLongOrNull() ?: 0L
                         val seq = params["seq"]?.toLongOrNull() ?: -1L
@@ -1353,10 +1351,6 @@ class StreamClient(
                             lastVideoSeq = seq
                         }
 
-                        Log.d(
-                            logFrom,
-                            "🔵 [FRAME RECEIVED] Parsed FRAME| params: seq=${if (seq >= 0L) seq else -1} size=$size, isKeyFrame=$isKeyFrame"
-                        )
                         if (size <= 0) {
                             Log.w(logFrom, "[Stream Client] 🔴 [FRAME RECEIVED] Invalid frame size in header: $line")
                             continue
@@ -3520,7 +3514,7 @@ class StreamClient(
             
             try {
                 // Feed AAC frame to decoder (ADTS-framed AAC)
-                val aacWrapper: AacFrame? = aacInputQueue.poll()
+                val aacWrapper: AacFrame? = aacInputQueue.poll(2, TimeUnit.MILLISECONDS)
                 if (aacWrapper != null && aacWrapper.length > 7) {
                     val inputIndex = decoder.dequeueInputBuffer(TIMEOUT_US)
                     if (inputIndex >= 0) {
@@ -3537,7 +3531,6 @@ class StreamClient(
                         aacWrapper.recycle()
                     }
                 } else if (aacWrapper == null) {
-                    Thread.sleep(2) // No data available
                     continue
                 } else {
                     // Bad frame
@@ -3822,25 +3815,32 @@ class StreamClient(
         }
     }
 
+    @Volatile private var heartbeatTickCount = 0L
+
     private fun startHeartbeat() {
         if (heartbeatRunning) return
         heartbeatRunning = true
         heartbeatExecutor.execute {
             while (heartbeatRunning && running) {
+                val interval = when {
+                    appInBackground -> HEARTBEAT_INTERVAL_BACKGROUND_MS
+                    currentState == ConnectionState.STREAMING || currentState == ConnectionState.RECOVERING -> HEARTBEAT_INTERVAL_STREAMING_MS
+                    currentState == ConnectionState.AUTHENTICATED || currentState == ConnectionState.CONNECTED -> HEARTBEAT_INTERVAL_AUTH_IDLE_MS
+                    else -> HEARTBEAT_PING_INTERVAL_MS
+                }
                 try {
-                    Thread.sleep(HEARTBEAT_PING_INTERVAL_MS)
+                    Thread.sleep(interval)
                 } catch (_: InterruptedException) {
                     break
                 }
-                // If the socket is gone, let reconnect logic handle it.
                 if (socket == null || out == null) continue
-                // Handshake watchdog: prevent "stuck on Starting stream…" forever.
                 checkHandshakeHealth(android.os.SystemClock.uptimeMillis())
                 val nowMs = System.currentTimeMillis()
                 val nowUptimeMs = android.os.SystemClock.uptimeMillis()
                 val sinceLastPong = if (lastPongUptimeMs > 0L) (nowUptimeMs - lastPongUptimeMs) else Long.MAX_VALUE
-                // CRITICAL DIAGNOSTIC: Log PING sends to help diagnose heartbeat issues
-                Log.d(logFrom, "[Stream Client] 🔵 [HEARTBEAT] Sending PING: sinceLastPong=${sinceLastPong}ms, state=$currentState")
+                if (heartbeatTickCount++ % 5L == 0L) {
+                    Log.d(logFrom, "[Stream Client] 🔵 [HEARTBEAT] PING interval=${interval}ms sinceLastPong=${sinceLastPong}ms state=$currentState")
+                }
                 send("PING|tsMs=$nowMs")
                 // Also use heartbeat ticks as a watchdog for stream activity.
                 // If frames stop arriving (Primary stopped capture) but PONGs keep coming, we should NOT remain STREAMING.
@@ -3866,7 +3866,7 @@ class StreamClient(
             // If we connected but never got AUTH_OK, treat as handshake failure.
             if (state == ConnectionState.CONNECTING) {
                 val sinceConnect = if (connectedUptimeMs > 0L) (nowUptimeMs - connectedUptimeMs) else Long.MAX_VALUE
-                if (sinceConnect >= 10_000L && lastAuthOkUptimeMs <= 0L) {
+                if (sinceConnect >= HANDSHAKE_AUTH_TIMEOUT_MS && lastAuthOkUptimeMs <= 0L) {
                     Log.w(logFrom, "[Stream Client] ⚠️ [HANDSHAKE] No AUTH_OK after ${sinceConnect}ms; reconnecting")
                     disconnectForRecovery("handshake_no_auth_ok")
                 }
@@ -3885,7 +3885,7 @@ class StreamClient(
                 val lastActivity = maxOf(lastFrameRxUptimeMs, lastFrameRenderUptimeMs)
                 val sinceLastActivity = if (lastActivity > 0L) (nowUptimeMs - lastActivity) else Long.MAX_VALUE
                 val noFramesEver = lastActivity <= 0L
-                val framesStalled = lastActivity > 0L && sinceLastActivity >= 6_000L
+                val framesStalled = lastActivity > 0L && sinceLastActivity >= HANDSHAKE_STREAM_STALL_TIMEOUT_MS
                 
                 // If we have recent frames, exit early (stream is healthy).
                 if (!noFramesEver && !framesStalled) return
@@ -3893,7 +3893,7 @@ class StreamClient(
                 val missingAccepted = lastStreamAcceptedUptimeMs <= 0L
                 val missingCsd = lastCsdUptimeMs <= 0L
 
-                if (sinceAuthOk >= 3_000L && sinceLastKick >= 2_500L && (missingAccepted || missingCsd)) {
+                if (sinceAuthOk >= HANDSHAKE_KICK_THROTTLE_MS && sinceLastKick >= HANDSHAKE_KICK_COOLDOWN_MS && (missingAccepted || missingCsd)) {
                     handshakeRetryCount++
                     lastHandshakeKickUptimeMs = nowUptimeMs
                     Log.w(
@@ -3909,7 +3909,7 @@ class StreamClient(
 
                 // If we're AUTHENTICATED for too long with no frames (or frames stalled), downgrade to CONNECTED to show "No Video".
                 // When server sends STREAM_STATE we never override (server is source of truth).
-                val shouldDowngrade = (noFramesEver && sinceAuthOk >= 12_000L) || framesStalled
+                val shouldDowngrade = (noFramesEver && sinceAuthOk >= HANDSHAKE_DOWNGRADE_NO_FRAMES_MS) || framesStalled
                 if (shouldDowngrade && canInferState()) {
                     Log.w(
                         logFrom,
@@ -3919,7 +3919,7 @@ class StreamClient(
                 }
 
                 // Hard limit: if still nothing after a long time, reconnect.
-                val shouldReconnect = (noFramesEver && sinceAuthOk >= 25_000L) || (framesStalled && sinceLastActivity >= 20_000L)
+                val shouldReconnect = (noFramesEver && sinceAuthOk >= HANDSHAKE_RECONNECT_NO_FRAMES_MS) || (framesStalled && sinceLastActivity >= HANDSHAKE_RECONNECT_STALLED_MS)
                 if (shouldReconnect) {
                     Log.w(
                         logFrom,
@@ -3944,30 +3944,30 @@ class StreamClient(
                 val sinceLastActivity =
                     if (lastActivity > 0L) (nowUptimeMs - lastActivity) else Long.MAX_VALUE
                 val noFramesEver = lastActivity <= 0L
-                val stalledAfterVideo = lastActivity > 0L && sinceLastActivity >= 6_000L
+                val stalledAfterVideo = lastActivity > 0L && sinceLastActivity >= HANDSHAKE_STREAM_STALL_TIMEOUT_MS
                 val sincePong = if (lastPongUptimeMs > 0L) (nowUptimeMs - lastPongUptimeMs) else Long.MAX_VALUE
 
                 // CRITICAL FIX: Increase timeout when audio frames are being received (connection is active)
                 // Audio frames indicate the connection is working, so PONG delay might be due to socket buffer processing
-                val audioActive = (nowUptimeMs - lastAudioDownRxUptimeMs) < 5_000L
+                val audioActive = (nowUptimeMs - lastAudioDownRxUptimeMs) < CONNECTED_AUDIO_ACTIVE_WINDOW_MS
                 val pongTimeout =
                     when {
-                        inGrace -> 25_000L
-                        audioActive -> 15_000L
-                        else -> 7_000L
-                    } // Longer timeout during recording/reconfigure grace window
+                        inGrace -> CONNECTED_PONG_TIMEOUT_GRACE_MS
+                        audioActive -> CONNECTED_PONG_TIMEOUT_AUDIO_MS
+                        else -> CONNECTED_PONG_TIMEOUT_MS
+                    }
                 
                 if (sincePong >= pongTimeout) {
                     Log.w(logFrom, "[Stream Client] ⚠️ [CONNECTED] No PONG for ${sincePong}ms while CONNECTED (audioActive=$audioActive, timeout=${pongTimeout}ms) -> disconnecting to recover")
                     disconnectForRecovery("connected_no_pong")
                     return
-                } else if (sincePong >= 5_000L) {
+                } else if (sincePong >= CONNECTED_PONG_WARN_MS) {
                     // Log warning before timeout to help diagnose
                     Log.w(logFrom, "[Stream Client] ⚠️ [CONNECTED] PONG delay: ${sincePong}ms (audioActive=$audioActive, timeout=${pongTimeout}ms)")
                 }
 
                 // Step 1: probe with keyframe requests (throttled).
-                if (sinceLastKick >= 5_000L) {
+                if (sinceLastKick >= CONNECTED_PROBE_THROTTLE_MS) {
                     lastHandshakeKickUptimeMs = nowUptimeMs
                     Log.w(
                         logFrom,
@@ -3980,8 +3980,8 @@ class StreamClient(
                 // Step 2: if still stuck, re-negotiate stream (CAPS + SET_STREAM) to re-arm Primary after crashes/resumes.
                 val sinceLastConnectedKick =
                     if (lastConnectedRecoveryKickUptimeMs > 0L) (nowUptimeMs - lastConnectedRecoveryKickUptimeMs) else Long.MAX_VALUE
-                if ((noFramesEver && sinceAuthOk >= 15_000L) || stalledAfterVideo) {
-                    if (sinceLastConnectedKick >= 12_000L) {
+                if ((noFramesEver && sinceAuthOk >= CONNECTED_RECOVERY_AUTH_THRESHOLD_MS) || stalledAfterVideo) {
+                    if (sinceLastConnectedKick >= CONNECTED_RECOVERY_COOLDOWN_MS) {
                         connectedRecoveryCount++
                         lastConnectedRecoveryKickUptimeMs = nowUptimeMs
                         val p = selectProfile()
@@ -4010,7 +4010,7 @@ class StreamClient(
                 // Stability improvement:
                 // If we had video before (stalledAfterVideo) but now receive no frames, recover faster.
                 // This addresses rare “silent decoder stall” cases where keyframe probes don't restore rendering.
-                val stuckTooLong = (noFramesEver && sinceAuthOk >= 45_000L) || (stalledAfterVideo && sinceLastActivity >= 10_000L)
+                val stuckTooLong = (noFramesEver && sinceAuthOk >= CONNECTED_STUCK_NO_FRAMES_MS) || (stalledAfterVideo && sinceLastActivity >= CONNECTED_STUCK_STALLED_MS)
                 if (stuckTooLong) {
                     Log.w(
                         logFrom,

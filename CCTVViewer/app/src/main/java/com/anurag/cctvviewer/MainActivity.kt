@@ -563,6 +563,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         // Periodically poll StreamClient health for UI classification (no pipeline control).
+                        // Adaptive interval: 1s when streaming healthy, 500ms during recovery/connecting (reduces battery + UI load).
                         var healthSnapshot by remember {
                             mutableStateOf<StreamHealthSnapshot?>(
                                 null
@@ -570,12 +571,21 @@ class MainActivity : ComponentActivity() {
                         }
                         LaunchedEffect(client) {
                             while (true) {
-                                healthSnapshot = try {
+                                val hs = try {
                                     client.getHealthSnapshot()
                                 } catch (_: Throwable) {
                                     null
                                 }
-                                delay(250)
+                                healthSnapshot = hs
+                                val intervalMs = when (hs?.connectionState) {
+                                    ConnectionState.STREAMING, ConnectionState.RECOVERING -> {
+                                        val sinceRender = hs.nowUptimeMs - hs.lastFrameRenderUptimeMs
+                                        if (sinceRender < 3_000L) 1_000L else 500L
+                                    }
+                                    ConnectionState.CONNECTING, ConnectionState.AUTHENTICATED, ConnectionState.CONNECTED -> 500L
+                                    else -> 1_000L
+                                }
+                                delay(intervalMs)
                             }
                         }
 

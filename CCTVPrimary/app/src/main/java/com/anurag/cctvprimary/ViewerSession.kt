@@ -238,16 +238,12 @@ class ViewerSession(
             lastPingUptimeMs = SystemClock.uptimeMillis()
             when {
                 line.startsWith("HELLO") -> {
-                    protocolVersion = 2
-                    if (line.contains("|")) {
-                        val params = parseParams(line)
-                        protocolVersion = params["version"]?.toIntOrNull()?.coerceIn(2, 3) ?: 2
-                    }
+                    protocolVersion = if (line.contains("|")) ProtocolParser.parseHelloVersion(ProtocolParser.parseParams(line)) else 2
                     sendControl("AUTH_CHALLENGE|v=2|salt=$authSalt")
                 }
 
                 line.startsWith("AUTH_RESPONSE|") -> {
-                    val params = parseParams(line)
+                    val params = ProtocolParser.parseParams(line)
                     val clientHash = params["hash"] ?: ""
                     val expectedHash = hmacSha256(passwordProvider(), authSalt)
                     
@@ -270,12 +266,13 @@ class ViewerSession(
                 }
 
                 line.startsWith("CAPS|") -> {
-                    val params = parseParams(line)
-                    viewerCaps = ViewerCaps(
-                        maxWidth = params["maxWidth"]!!.toInt(),
-                        maxHeight = params["maxHeight"]!!.toInt(),
-                        maxBitrate = params["maxBitrate"]!!.toInt()
-                    )
+                    val caps = ProtocolParser.parseCaps(ProtocolParser.parseParams(line))
+                    if (caps == null) {
+                        Log.w(TAG, "[VIEWER SESSION] CAPS malformed or invalid: $line")
+                        sendControl("ERROR|reason=invalid_caps")
+                        return
+                    }
+                    viewerCaps = caps
                     sendControl("CAPS_OK")
                 }
                 line.startsWith("RESUME|") -> {
@@ -296,15 +293,12 @@ class ViewerSession(
                         sendControl("ERROR|reason=caps_required")
                         return
                     }
-                    val params = parseParams(line)
-
-                    val cfg = StreamConfig(
-                        width = params["width"]!!.toInt(),
-                        height = params["height"]!!.toInt(),
-                        bitrate = params["bitrate"]!!.toInt(),
-                        fps = params["fps"]!!.toInt()
-
-                    )
+                    val cfg = ProtocolParser.parseSetStream(ProtocolParser.parseParams(line))
+                    if (cfg == null) {
+                        Log.w(TAG, "[VIEWER SESSION] SET_STREAM malformed or invalid: $line")
+                        sendControl("ERROR|reason=invalid_set_stream")
+                        return
+                    }
 
                     if (cfg.width > caps.maxWidth || cfg.height > caps.maxHeight || cfg.bitrate > caps.maxBitrate) {
                         sendControl("STREAM_REJECTED|reason=unsupported")
@@ -327,7 +321,7 @@ class ViewerSession(
                 }
                 line == "PING" || line.startsWith("PING|") -> {
                     // Already updated at top for all commands; keep explicit branch for protocol response.
-                    val params = if (line.startsWith("PING|")) parseParams(line) else emptyMap()
+                    val params = if (line.startsWith("PING|")) ProtocolParser.parseParams(line) else emptyMap()
                     val tsMs = params["tsMs"]?.toLongOrNull()
                     val srvMs = System.currentTimeMillis()
                     if (tsMs != null) {
@@ -352,7 +346,7 @@ class ViewerSession(
                 line == "SWITCH_CAMERA" -> onCommand(this, RemoteCommand.SWITCH_CAMERA, null)
 
                 line.startsWith("ZOOM|") -> {
-                    val params = parseParams(line)
+                    val params = ProtocolParser.parseParams(line)
                     val ratio = params["ratio"]?.toFloatOrNull()
                     if (ratio != null) {
                         onCommand(this, RemoteCommand.ZOOM, ratio)
@@ -360,7 +354,7 @@ class ViewerSession(
                 }
 
                 line.startsWith("AUDIO_FRAME|") -> {
-                    val params = parseParams(line)
+                    val params = ProtocolParser.parseParams(line)
                     val size = params["size"]?.toIntOrNull() ?: 0
                     if (size > 0) {
                         val buffer = ByteArray(size)
@@ -381,7 +375,7 @@ class ViewerSession(
                 }
                 
                 line.startsWith("ADJUST_BITRATE|") -> {
-                    val params = parseParams(line)
+                    val params = ProtocolParser.parseParams(line)
                     val bitrate = params["bitrate"]?.toIntOrNull()
                     if (bitrate != null && bitrate > 0) {
                         onCommand(this, RemoteCommand.ADJUST_BITRATE, bitrate)
@@ -429,25 +423,16 @@ class ViewerSession(
         // Under load (e.g. motion), never silently drop keyframes; it causes visible decoder artifacts
         // until the next keyframe arrives.
         if (frame.isKeyFrame) {
-            // Prefer flushing stale P-frames so the viewer can decode cleanly ASAP.
             val cleared = frameQueue.size
             frameQueue.clear()
             frameQueue.offer(frame)
-            if (cleared > 0) {
-                Log.d(TAG, "🔵 [VIEWER SESSION] Keyframe received - cleared $cleared stale frames from queue")
-            }
-            Log.d(TAG, "🔵 [VIEWER SESSION] Keyframe enqueued: size=${frame.data.size}, queueSize=${frameQueue.size}, state=$state, senderRunning=$senderRunning")
+            if (cleared > 5) Log.d(TAG, "🔵 [VIEWER SESSION] Keyframe cleared $cleared stale frames")
             return
         }
         if (!frameQueue.offer(frame)) {
-            // Drop oldest to keep latency bounded, then enqueue.
             framesDroppedCount.incrementAndGet()
             frameQueue.poll()
             frameQueue.offer(frame)
-        }
-        // Log every 30th frame to track frame flow
-        if (frameQueue.size % 30 == 0) {
-            Log.d(TAG, "🔵 [VIEWER SESSION] Frame enqueued: size=${frame.data.size}, queueSize=${frameQueue.size}, state=$state, senderRunning=$senderRunning")
         }
     }
 
@@ -643,15 +628,6 @@ class ViewerSession(
     /* ===============================
      * Helpers
      * =============================== */
-    private fun parseParams(line: String): Map<String, String> {
-        return line.substringAfter("|")
-            .split("|")
-            .associate {
-                val (k, v) = it.split("=")
-                k to v
-            }
-    }
-
     private fun handleAuthSuccess() {
         if (authenticated.compareAndSet(false, true)) {
             Log.d(TAG, "[VIEWER SESSION] Authentication successful — activating session")

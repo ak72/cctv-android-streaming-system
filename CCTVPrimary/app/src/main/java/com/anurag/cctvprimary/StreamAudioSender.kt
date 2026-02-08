@@ -4,7 +4,8 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.util.Log
-import java.util.ArrayDeque
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.math.tanh
 
 /**
@@ -35,8 +36,7 @@ class StreamAudioSender(
     private val audioSampleRate = 48000
     private val aacBitrate = 64_000 // 64 kbps for good quality at low bandwidth
     private var aacEncoder: MediaCodec? = null
-    private val aacInputQueue = ArrayDeque<ByteArray>()
-    private val aacInputLock = Any()
+    private val aacInputQueue = LinkedBlockingQueue<ByteArray>(60)
     private var encoderThread: Thread? = null
     @Volatile private var isEncoding = false
     
@@ -70,10 +70,7 @@ class StreamAudioSender(
             // Apply volume boost with soft limiting
             val processedPcm = applyGainWithSoftLimit(pcm)
             
-            // Queue PCM data for AAC encoding
-            synchronized(aacInputLock) {
-                aacInputQueue.offer(processedPcm)
-            }
+            aacInputQueue.offer(processedPcm)
         } catch (e: Exception) {
             Log.e(logFrom, "Error processing audio", e)
         }
@@ -205,20 +202,14 @@ class StreamAudioSender(
             val encoder = aacEncoder ?: break
             
             try {
-                // Feed PCM data to encoder
+                // Feed PCM data to encoder (block up to 5ms when idle)
                 while (true) {
-                    val pcm: ByteArray? = synchronized(aacInputLock) {
-                        aacInputQueue.poll()
-                    }
-                    
+                    val pcm: ByteArray? = aacInputQueue.poll(5, TimeUnit.MILLISECONDS)
                     if (pcm == null) break
-                    
+
                     val inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
                     if (inputIndex < 0) {
-                        // No input buffer available, put PCM back
-                        synchronized(aacInputLock) {
-                            aacInputQueue.offerFirst(pcm)
-                        }
+                        aacInputQueue.offer(pcm)
                         break
                     }
                     
@@ -275,8 +266,6 @@ class StreamAudioSender(
                         else -> break
                     }
                 }
-                
-                Thread.sleep(5) // Small delay to prevent busy-waiting
             } catch (e: Exception) {
                 Log.e(logFrom, "Error in encoding loop", e)
                 break

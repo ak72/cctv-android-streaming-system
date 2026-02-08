@@ -83,6 +83,14 @@ class AudioSourceEngine private constructor() {
     
     @Volatile
     private var recordingRefCount = 0
+
+    /**
+     * Optional callback invoked when mic capture is about to start (ref counts go from 0 to >0).
+     * Used by CameraForegroundService for FGS type escalation (CAMERA -> CAMERA|MICROPHONE).
+     * Invoked from register methods before startCaptureIfNeeded(); caller may post to main thread.
+     */
+    @Volatile
+    var onMicCaptureAboutToStart: (() -> Unit)? = null
     
     // Listeners (thread-safe)
     //
@@ -129,8 +137,12 @@ class AudioSourceEngine private constructor() {
                     return
                 }
 
+                val wasCapturing = streamingRefCount > 0 || recordingRefCount > 0
                 listeners.add(listener)
                 streamingRefCount++
+                if (!wasCapturing && (streamingRefCount > 0 || recordingRefCount > 0)) {
+                    onMicCaptureAboutToStart?.invoke()
+                }
                 Log.d(TAG, "Streaming listener registered, refCount=$streamingRefCount, totalListeners=${listeners.size}")
                 startCaptureIfNeeded()
             } catch (e: Exception) {
@@ -176,8 +188,12 @@ class AudioSourceEngine private constructor() {
                     return
                 }
 
+                val wasCapturing = streamingRefCount > 0 || recordingRefCount > 0
                 listeners.add(listener)
                 recordingRefCount++
+                if (!wasCapturing && (streamingRefCount > 0 || recordingRefCount > 0)) {
+                    onMicCaptureAboutToStart?.invoke()
+                }
                 Log.d(TAG, "Recording listener registered, refCount=$recordingRefCount, totalListeners=${listeners.size}")
                 // If we were previously capturing for streaming only, upgrade to recording-optimized source.
                 maybeRestartForModeChangeLocked()

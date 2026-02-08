@@ -457,46 +457,21 @@ class StreamServer(
             commandBus.post(StreamCommand.RequestKeyframe)
         }
     }
+    /** Sampled metrics: last log time for rate-limiting (every 3s). */
+    @Volatile private var lastEnqueueMetricsLogMs: Long = 0L
+    private val framesEnqueuedSinceLog = java.util.concurrent.atomic.AtomicLong(0L)
+    private val framesDroppedSinceLog = java.util.concurrent.atomic.AtomicLong(0L)
+    private val keyframesEnqueuedSinceLog = java.util.concurrent.atomic.AtomicLong(0L)
+
     // 🔑 Called Externally (encoder pushes to FrameBus via this; sender loop drains from frameBus)
     fun enqueueFrame(frame: EncodedFrame) {
-        val queueSizeBefore = frameBus.size()
         val sessionsCount = sessions.size
         val enqueueTimeMs = System.currentTimeMillis()
-        val frameAgeMs = if (frame.captureEpochMs > 0) (enqueueTimeMs - frame.captureEpochMs).coerceAtLeast(0L) else -1L
-        val ageInfo = if (frameAgeMs >= 0) {
-            "age=${frameAgeMs}ms (capture→enqueue)"
-        } else {
-            "age=unknown"
-        }
-        val shouldLog = frame.isKeyFrame || queueSizeBefore < 5 || (System.currentTimeMillis() % 1000) < 100
-        if (shouldLog) {
-            Log.d(logFrom, "🔵 [STREAM SERVER] enqueueFrame called: size=${frame.data.size}, isKeyFrame=${frame.isKeyFrame}, running=$running, sessions=$sessionsCount, queueSizeBefore=$queueSizeBefore, pts=${frame.presentationTimeUs}us, $ageInfo")
-        }
-        if (!running) {
-            if (shouldLog) {
-                Log.w(logFrom, "🔵 [STREAM SERVER] enqueueFrame called but sender not running")
-            }
-            return
-        }
 
-        // Viewer-aware load shedding:
-        // If there are no active sessions, do not enqueue frames at all.
-        //
-        // Intent:
-        // - Reduce memory churn and queue pressure when nobody is watching.
-        // - Avoid needless work in the sender thread (which would just drop frames anyway).
-        //
-        // Note:
-        // - We still keep `lastCsd` and on connect we explicitly request an IDR (StreamServer already does),
-        //   so skipping frame enqueue here does NOT harm join/reconnect behavior.
-        if (sessionsCount <= 0) {
-            if (shouldLog) {
-                Log.d(logFrom, "🔵 [STREAM SERVER] No active sessions; skipping enqueue (size=${frame.data.size}, key=${frame.isKeyFrame})")
-            }
-            return
-        }
+        if (!running) return
 
-        // DROP_NON_KEYFRAME_ON_FULL: see FrameBus class doc. Caller checks return value and prioritizes keyframe or drops.
+        if (sessionsCount <= 0) return
+
         val offered = frameBus.publish(frame)
         val queueSizeAfter = frameBus.size()
         if (!offered) {
@@ -508,21 +483,25 @@ class StreamServer(
                 } catch (t: Throwable) {
                     Log.w(logFrom, "⚠️ [STREAM SERVER] Failed to prioritize keyframe under overload (non-fatal)", t)
                 }
-                Log.w(
-                    logFrom,
-                    "⚠️ [STREAM SERVER] FrameBus FULL - prioritized KEYFRAME by clearing $cleared stale frame(s): " +
-                        "size=${frame.data.size}, queueSizeAfter=${frameBus.size()}, age=${frameAgeMs}ms"
-                )
+                if (enqueueTimeMs - lastEnqueueMetricsLogMs >= 3_000L) {
+                    lastEnqueueMetricsLogMs = enqueueTimeMs
+                    Log.w(logFrom, "⚠️ [STREAM SERVER] FrameBus FULL - prioritized KEYFRAME cleared=$cleared enqueued=${framesEnqueuedSinceLog.getAndSet(0)} dropped=${framesDroppedSinceLog.getAndSet(0)}")
+                }
             } else {
                 droppedFramesSinceLastLog.incrementAndGet()
-                Log.w(
-                    logFrom,
-                    "⚠️ [STREAM SERVER] FrameBus FULL (capacity=$FRAME_QUEUE_CAPACITY), dropping non-key frame: " +
-                        "size=${frame.data.size}, queueSizeBefore=$queueSizeBefore, queueSizeAfter=$queueSizeAfter, age=${frameAgeMs}ms"
-                )
+                framesDroppedSinceLog.incrementAndGet()
+                if (enqueueTimeMs - lastEnqueueMetricsLogMs >= 3_000L) {
+                    lastEnqueueMetricsLogMs = enqueueTimeMs
+                    Log.w(logFrom, "⚠️ [STREAM SERVER] FrameBus FULL dropping non-key: enqueued=${framesEnqueuedSinceLog.getAndSet(0)} dropped=${framesDroppedSinceLog.getAndSet(0)} queue=$queueSizeAfter")
+                }
             }
-        } else if (shouldLog) {
-            Log.d(logFrom, "🔵 [STREAM SERVER] Frame enqueued successfully: size=${frame.data.size}, isKeyFrame=${frame.isKeyFrame}, queueSizeBefore=$queueSizeBefore, queueSizeAfter=$queueSizeAfter, sessions=$sessionsCount, pts=${frame.presentationTimeUs}us, $ageInfo")
+        } else {
+            framesEnqueuedSinceLog.incrementAndGet()
+            if (frame.isKeyFrame) keyframesEnqueuedSinceLog.incrementAndGet()
+            if (enqueueTimeMs - lastEnqueueMetricsLogMs >= 3_000L) {
+                lastEnqueueMetricsLogMs = enqueueTimeMs
+                Log.d(logFrom, "🔵 [STREAM SERVER] Metrics: enqueued=${framesEnqueuedSinceLog.getAndSet(0)} keyframes=${keyframesEnqueuedSinceLog.getAndSet(0)} dropped=${framesDroppedSinceLog.getAndSet(0)} queue=$queueSizeAfter sessions=$sessionsCount")
+            }
         }
     }
 
