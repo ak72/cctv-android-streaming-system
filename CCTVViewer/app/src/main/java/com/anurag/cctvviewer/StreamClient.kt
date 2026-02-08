@@ -10,11 +10,8 @@ import android.os.Looper
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.nio.ByteBuffer
-import java.util.concurrent.Executors
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import android.media.AudioTrack
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -73,22 +70,7 @@ class StreamClient(
     private var input: BufferedInputStream? = null
     private val inputLock = Any() // Lock for synchronizing input stream access
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var senderExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Client-Sender").apply { isDaemon = true }
-    }
-    private val senderClosed = AtomicBoolean(false)
-    private var heartbeatExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Heartbeat").apply { isDaemon = true }
-    }
-    private var audioRecordExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Audio-Talk").apply { isDaemon = true }
-    }
-    private var reconnectExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Reconnect").apply { isDaemon = true }
-    }
-    private var connectExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Connect").apply { isDaemon = true }
-    }
+    private val executors = StreamClientExecutors()
     @Volatile private var heartbeatRunning = false
 
     // --- Recording/reconfigure tolerance window ---
@@ -111,13 +93,7 @@ class StreamClient(
     /* ===============================
          * Stream / decode state
          * =============================== */
-    private val decodeQueue = java.util.concurrent.ArrayBlockingQueue<IncomingFrame>(30)
-    private var decodeExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
-            r.run()
-        }.apply { name = "CCTV-Decode"; isDaemon = true }
-    }
+    private val decodeQueue = java.util.concurrent.ArrayBlockingQueue<IncomingFrame>(decodeQueueCapacityForTier())
 
     // CRITICAL FIX: Reusable scratch buffer for efficiently draining frames when decoding is paused
     // This prevents memory allocation churn during background mode (avoids GC pressure)
@@ -495,10 +471,7 @@ class StreamClient(
     @Volatile private var audioDecoding = false
     
     // Audio playback queue and executor to offload AudioTrack.write() from network loop
-    private val audioPlaybackQueue = LinkedBlockingQueue<AudioPacket>(80) // Buffer ~3 second of audio for jitter tolerance
-    private var audioPlaybackExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CCTV-Audio-Playback").apply { isDaemon = true }
-    }
+    private val audioPlaybackQueue = LinkedBlockingQueue<AudioPacket>(audioPlaybackQueueCapacityForTier())
     @Volatile private var audioPlaybackRunning = false
     @Volatile private var latestPlayedAudioTsUs: Long = 0L
 
@@ -569,49 +542,8 @@ class StreamClient(
         queuedKeyframeSinceReset = false
         firstQueuedKeyframePtsUsSinceReset = -1L
         nordCe4OutputWarmupDropsRemaining = 0
-        
-        // Ensure executors are available (they may have been shut down previously)
-        synchronized(this) {
-            if (connectExecutor.isShutdown) {
-                connectExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread(r, "CCTV-Connect").apply { isDaemon = true }
-                }
-            }
-            if (decodeExecutor.isShutdown) {
-                decodeExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread {
-                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
-                        r.run()
-                    }.apply { name = "CCTV-Decode"; isDaemon = true }
-                }
-            }
-            if (heartbeatExecutor.isShutdown) {
-                heartbeatExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread(r, "CCTV-Heartbeat").apply { isDaemon = true }
-                }
-            }
-            if (audioRecordExecutor.isShutdown) {
-                audioRecordExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread(r, "CCTV-Audio-Talk").apply { isDaemon = true }
-                }
-            }
-            if (reconnectExecutor.isShutdown) {
-                reconnectExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread(r, "CCTV-Reconnect").apply { isDaemon = true }
-                }
-            }
-            if (senderExecutor.isShutdown) {
-                senderExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread(r, "CCTV-Client-Sender").apply { isDaemon = true }
-                }
-                senderClosed.set(false)
-            }
-            if (audioPlaybackExecutor.isShutdown) {
-                audioPlaybackExecutor = Executors.newSingleThreadExecutor { r ->
-                    Thread(r, "CCTV-Audio-Playback").apply { isDaemon = true }
-                }
-            }
-        }
+
+        executors.ensureAll()
 
         // #region agent log
         if (debugRunId == null) debugRunId = java.util.UUID.randomUUID().toString().take(8)
@@ -619,7 +551,7 @@ class StreamClient(
         // #endregion
         postState(ConnectionState.CONNECTING)
 
-        connectExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.CONNECT) {
             try {
                 val targetHost = host.trim()
                 if (targetHost.isEmpty()) {
@@ -822,15 +754,8 @@ class StreamClient(
         releaseAudioTrack()
         
         // Shutdown executors only on final shutdown (app disposal)
-        // CRITICAL FIX: Check if executors are already shut down to avoid warnings
         try {
-            if (!decodeExecutor.isShutdown) decodeExecutor.shutdownNow()
-            if (!heartbeatExecutor.isShutdown) heartbeatExecutor.shutdownNow()
-            if (!audioRecordExecutor.isShutdown) audioRecordExecutor.shutdownNow()
-            if (!audioPlaybackExecutor.isShutdown) audioPlaybackExecutor.shutdownNow()
-            if (!reconnectExecutor.isShutdown) reconnectExecutor.shutdownNow()
-            if (!connectExecutor.isShutdown) connectExecutor.shutdownNow()
-            if (!senderExecutor.isShutdown) senderExecutor.shutdownNow()
+            executors.shutdownAll()
             Log.d(logFrom, "[Stream Client] 🔵 [SHUTDOWN] All executors shut down successfully")
         } catch (e: Exception) {
             Log.w(logFrom, "[Stream Client] ⚠️ [SHUTDOWN] Executor shutdown error (non-fatal)", e)
@@ -1757,8 +1682,7 @@ class StreamClient(
     fun send(command: String) {
         Log.d(logFrom, "[Stream Client] SEND: $command")
         val o = out ?: return
-        if (senderClosed.get()) return
-        senderExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.SENDER) {
             try {
                 val bytes = command.toByteArray(Charsets.UTF_8)
                 synchronized(writeLock) {
@@ -2034,7 +1958,7 @@ class StreamClient(
         }
         Log.d(logFrom, "[Stream Client] 🔵 [DECODE LOOP] Starting decode loop - decodeRunning=$decodeRunning, queueSize=${decodeQueue.size}, decoder=${decoder != null}, waitingForKeyframe=$waitingForKeyframe")
         decodeRunning = true
-        decodeExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.DECODE) {
             Log.d(logFrom, "[Stream Client] 🔵 [DECODE LOOP] Decode loop thread started - thread=${Thread.currentThread().name}")
             while (decodeRunning) {
                 try {
@@ -3403,7 +3327,7 @@ class StreamClient(
         if (audioPlaybackRunning) return
         audioPlaybackRunning = true
         audioPlaybackQueue.clear() // Clear any stale packets
-        audioPlaybackExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.AUDIO_PLAYBACK) {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
             while (audioPlaybackRunning) {
                 try {
@@ -3630,7 +3554,7 @@ class StreamClient(
     fun startTalk() {
         if (talkActive) return
         talkActive = true
-        audioRecordExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.AUDIO_RECORD) {
             val minBuf = AudioRecord.getMinBufferSize(
                 AUDIO_SAMPLE_RATE,
                 AUDIO_CHANNEL_CONFIG_IN,
@@ -3741,7 +3665,7 @@ class StreamClient(
         val o = out ?: return
         // CRITICAL:
         // `data` is a reused buffer from the AudioRecord loop.
-        // Since we send on `senderExecutor`, the buffer may be overwritten by the next mic read
+        // Since we send on SENDER executor, the buffer may be overwritten by the next mic read
         // before the write happens → garbled/quiet/unclear talkback on Primary.
         val payload = ByteArrayPool.get(len)
         System.arraycopy(data, 0, payload, 0, len)
@@ -3762,7 +3686,7 @@ class StreamClient(
             } catch (_: Throwable) {
             }
         }
-        senderExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.SENDER) {
             try {
                 val header = "AUDIO_FRAME|dir=up|size=$len|rate=$AUDIO_SAMPLE_RATE|ch=1\n"
                 val headerBytes = header.toByteArray(Charsets.UTF_8)
@@ -3807,12 +3731,7 @@ class StreamClient(
     }
 
     private fun closeSender() {
-        if (senderClosed.compareAndSet(false, true)) {
-            try {
-                senderExecutor.shutdownNow()
-            } catch (_: Exception) {
-            }
-        }
+        executors.closeSender()
     }
 
     @Volatile private var heartbeatTickCount = 0L
@@ -3820,7 +3739,7 @@ class StreamClient(
     private fun startHeartbeat() {
         if (heartbeatRunning) return
         heartbeatRunning = true
-        heartbeatExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.HEARTBEAT) {
             while (heartbeatRunning && running) {
                 val interval = when {
                     appInBackground -> HEARTBEAT_INTERVAL_BACKGROUND_MS
@@ -4166,7 +4085,7 @@ class StreamClient(
         lastReconnectUptimeMs = nowUptimeMs
         Log.d(logFrom, "[Stream Client] 🔄 [RECONNECT] Scheduling reconnect attempt #${reconnectAttemptCount + 1} after ${backoffMs}ms backoff")
         
-        reconnectExecutor.execute {
+        executors.execute(StreamClientExecutors.Role.RECONNECT) {
             try {
                 Thread.sleep(backoffMs)
             } catch (_: InterruptedException) {

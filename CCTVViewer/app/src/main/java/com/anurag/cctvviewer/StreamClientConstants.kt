@@ -1,6 +1,7 @@
 package com.anurag.cctvviewer
 
 import android.media.AudioFormat
+import android.os.Build
 
 // StreamClient timing / socket constants
 internal const val DECODE_TIMEOUT_US: Long = 10_000L
@@ -40,6 +41,40 @@ internal const val AUDIO_CHANNEL_CONFIG_IN: Int = AudioFormat.CHANNEL_IN_MONO
 internal const val AUDIO_FORMAT: Int = AudioFormat.ENCODING_PCM_16BIT
 internal const val AUDIO_FRAME_MS: Int = 20
 internal const val AUDIO_BYTES_PER_FRAME: Int = (AUDIO_SAMPLE_RATE / 1000) * AUDIO_FRAME_MS * 2
+
+// --- Device-tier queue capacities (lower on weak devices for latency + memory) ---
+internal const val DECODE_QUEUE_CAPACITY_LOW: Int = 15
+internal const val DECODE_QUEUE_CAPACITY_MID: Int = 25
+internal const val DECODE_QUEUE_CAPACITY_HIGH: Int = 30
+internal const val AUDIO_PLAYBACK_QUEUE_CAPACITY_LOW: Int = 40
+internal const val AUDIO_PLAYBACK_QUEUE_CAPACITY_MID: Int = 60
+internal const val AUDIO_PLAYBACK_QUEUE_CAPACITY_HIGH: Int = 80
+
+internal fun decodeQueueCapacityForTier(): Int {
+    val perfClass = if (Build.VERSION.SDK_INT >= 31) Build.VERSION.MEDIA_PERFORMANCE_CLASS else 0
+    val cores = Runtime.getRuntime().availableProcessors()
+    val memMb = (Runtime.getRuntime().maxMemory() / (1024 * 1024)).toInt()
+    val lowTier = memMb < 1500 || cores <= 4
+    val highTier = perfClass >= 31 || (memMb >= 2500 && cores >= 6)
+    return when {
+        lowTier -> DECODE_QUEUE_CAPACITY_LOW
+        highTier -> DECODE_QUEUE_CAPACITY_HIGH
+        else -> DECODE_QUEUE_CAPACITY_MID
+    }
+}
+
+internal fun audioPlaybackQueueCapacityForTier(): Int {
+    val perfClass = if (Build.VERSION.SDK_INT >= 31) Build.VERSION.MEDIA_PERFORMANCE_CLASS else 0
+    val cores = Runtime.getRuntime().availableProcessors()
+    val memMb = (Runtime.getRuntime().maxMemory() / (1024 * 1024)).toInt()
+    val lowTier = memMb < 1500 || cores <= 4
+    val highTier = perfClass >= 31 || (memMb >= 2500 && cores >= 6)
+    return when {
+        lowTier -> AUDIO_PLAYBACK_QUEUE_CAPACITY_LOW
+        highTier -> AUDIO_PLAYBACK_QUEUE_CAPACITY_HIGH
+        else -> AUDIO_PLAYBACK_QUEUE_CAPACITY_MID
+    }
+}
 
 // --- Lightweight adaptive jitter buffer (Viewer video) ---
 internal const val JITTER_MIN_FRAMES: Int = 2

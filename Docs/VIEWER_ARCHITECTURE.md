@@ -4,9 +4,12 @@
 The **CCTVViewer** app is a complex real-time video receiver. Unlike a standard video player (ExoPlayer/VLC) which buffers seconds of content, this app must play video with **minimum latency** (sub-500ms) while handling network jitter, packet loss, and device diversity. For the full list of protocol commands and message fields, see [Protocol & Message Fields](PROTOCOL_REFERENCE.md#protocol--message-fields-consolidated).
 
 ## 2. Core Components `(StreamClient.kt)`
-The `StreamClient` class orchestrates the entire session. It uses a **multi-threaded architecture** to prevent blocking the UI or the network.
+The `StreamClient` class orchestrates the entire session. It uses a **multi-threaded architecture** via **`StreamClientExecutors`** to prevent blocking the UI or the network.
 
-### A. The Threading Model
+### A. The Threading Model (`StreamClientExecutors`)
+
+All executors are owned by a centralized **`StreamClientExecutors`** manager, which handles create/recreate/shutdown lifecycle and reduces race complexity. Roles: CONNECT, DECODE, HEARTBEAT, SENDER, AUDIO_RECORD, AUDIO_PLAYBACK, RECONNECT.
+
 1.  **Network Receiver Thread** (`listen()`):
     *   Reads from the TCP socket.
     *   Parses text commands (`SESSION`, `CSD`).
@@ -19,14 +22,14 @@ The `StreamClient` class orchestrates the entire session. It uses a **multi-thre
     *   Sends commands (Heartbeats, Talkback Audio) to the Primary.
     *   Decoupled from the UI to prevent "Application Not Responding" (ANR) if the network stalls.
 4.  **Audio Playback Thread**:
-    *   Feeds incoming audio PCM chunks to `AudioTrack`.
+    *   Feeds incoming audio PCM chunks to `AudioTrack`. Uses a **device-tier** playback queue (low: 40, mid: 60, high: 80 packets; ~2–3 s at 20 ms/frame).
 5.  **Watchdog (Heartbeat) Thread**:
     *   Monitors connection health every 2 seconds.
 
 ## 3. The Video Pipeline
 
 ### A. Adaptive Jitter Buffering
-*   **Queue**: `ArrayBlockingQueue<IncomingFrame>` (Adaptive, typically 2-4 frames).
+*   **Queue**: `ArrayBlockingQueue<IncomingFrame>` with **device-tier capacity** (low: 15, mid: 25, high: 30). Target backlog is adaptive (typically 2-4 frames).
 *   **Purpose**: Absorbs network jitter. If the network delivers 5 frames in 10ms (burst), the queue absorbs them so the decoder can process them at a steady pace.
 *   **Adaptive Logic**: The system monitors inter-arrival times and calculates an EWMA (Exponential Weighted Moving Average) of jitter. It dynamically adjusts the target queue size:
     *   **Low Jitter (LAN)**: 2 frames (Min latency).
@@ -57,9 +60,10 @@ The `ConnectionState` enum drives the UI:
 7.  **IDLE**: Stream intentionally stopped by server (STREAM_STATE|4). Pipeline inactive; distinct from CONNECTED.
 
 ## 5. Resilience & Watchdogs
-Real-world networks are unstable. The Viewer employs aggressive self-healing:
+Real-world networks are unstable. The Viewer employs aggressive self-healing. Handshake and stream health timeouts are defined in **`StreamClientConstants.kt`** (e.g. `HANDSHAKE_AUTH_TIMEOUT_MS`, `HANDSHAKE_STREAM_STALL_TIMEOUT_MS`, `CONNECTED_PONG_TIMEOUT_MS`).
+
 *   **Connection Watchdog**:
-    *   **Handshake watchdog**: If no `AUTH_OK` after ~10s of TCP connect, it forces a reconnect.
+    *   **Handshake watchdog**: If no `AUTH_OK` after `HANDSHAKE_AUTH_TIMEOUT_MS` (~10 s) of TCP connect, it forces a reconnect.
     *   **Start-stall watchdog**: If authenticated but no frames start, it retries negotiation (re-sends `CAPS` + `SET_STREAM`) and requests keyframes. It downgrades UI to `CONNECTED` ("No Video") after ~12s, and may reconnect after ~25s (unless in a recording/reconfigure grace window).
     *   **Connected/No-Video watchdog**: If PONGs stop for a short, state-dependent timeout (≈7s normally, longer if audio is flowing or during grace), it disconnects to recover. Otherwise it escalates in steps: keyframe probe → renegotiate → reconnect (last resort).
 *   **Stream watchdog**:

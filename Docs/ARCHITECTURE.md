@@ -111,6 +111,12 @@ Thus: **ViewerSession** (or StreamServer) receives a protocol command → conver
 
 When **no viewers** are connected, **not recording**, and **Primary UI is not visible**, the service enters **low-power idle mode**: resolution and FPS are reduced (e.g. 480×640 @ 15 fps, bitrate capped), and the last “active” config is stored. When a viewer connects, recording starts, or the UI becomes visible again, the previous high-quality config is restored. This reduces battery and thermal load when the camera is unattended.
 
+**Extensions:**
+- **Battery/charging-aware profiles**: When entering idle, if unplugged and battery < 20%, bitrate cap is 600 kbps (else 900 kbps). Battery state is monitored via `BatteryManager` / `ACTION_BATTERY_CHANGED`.
+- **Idle entry hysteresis**: 10 s delay before entering low-power to avoid flapping on brief viewer disconnects.
+- **Thermal tier scaling**: Progressive encoder throttling by thermal status (MODERATE 10%, SEVERE 30%, CRITICAL 50%, EMERGENCY 70% bitrate reduction). MODERATE tier available on API 31+.
+- **Thermal debounce**: 15 s debounce before applying thermal throttling to ignore brief thermal spikes.
+
 ### 2.8. CameraForegroundService (Orchestrator) Summary
 
 - **Lifecycle:** Binds CameraX (Preview, optional ImageAnalysis, optional VideoCapture for combo probe); applies `DeviceProfile` (resolution, FPS cap, buffer vs surface).

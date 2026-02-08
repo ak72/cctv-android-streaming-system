@@ -37,6 +37,8 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.Observer
 import androidx.core.content.edit
 import android.os.PowerManager
+import android.os.BatteryManager
+import android.content.IntentFilter
 import android.util.Rational
 import android.util.Size
 import android.view.Surface
@@ -80,6 +82,13 @@ class CameraForegroundService : LifecycleService() {
         /** Encoder watchdog: if no keyframe for this long, post RecoverEncoder (same cooldown path). */
         private const val ENCODER_WATCHDOG_KEYFRAME_TIMEOUT_MS = 45_000L
         private const val ENCODER_WATCHDOG_CHECK_INTERVAL_MS = 30_000L
+
+        /** Idle low-power: delay entry to avoid flapping on brief disconnects. */
+        private const val IDLE_ENTRY_DELAY_MS = 10_000L
+        /** Thermal: debounce before throttling to ignore brief spikes. */
+        private const val THERMAL_DEBOUNCE_MS = 15_000L
+        /** Battery level below which idle uses extra-conservative bitrate when unplugged. */
+        private const val BATTERY_LOW_THRESHOLD_PCT = 20
     }
 
     /* ---------------- CameraX ---------------- */
@@ -178,6 +187,15 @@ class CameraForegroundService : LifecycleService() {
     @Volatile
     private var lastNonIdleConfig: StreamConfig? = null
 
+    @Volatile
+    private var batteryLevelPct: Int = 100
+
+    @Volatile
+    private var batteryCharging: Boolean = false
+
+    private var idleEntryPendingRunnable: Runnable? = null
+    private var thermalDebounceRunnable: Runnable? = null
+
     // Some devices cannot bind our Surface-mode "double Preview + ImageAnalysis" combination.
     // If we detect that, force Buffer mode for the remainder of this process lifetime.
     @Volatile
@@ -193,73 +211,96 @@ class CameraForegroundService : LifecycleService() {
 
     private fun updateIdleState(reason: String) {
         val idleNow = (activeViewerSessions <= 0) && !isRecordingActive() && !primaryUiVisible
-        if (idleNow == lowPowerIdleMode) return
 
-        lowPowerIdleMode = idleNow
-
-        if (idleNow) {
-            // Snapshot the current (active) operating point so we can restore it when a viewer connects
-            // or recording/UI becomes active again.
-            lastNonIdleConfig = StreamConfig(
-                width = currentWidth,
-                height = currentHeight,
-                bitrate = currentBitrate,
-                fps = currentFPS
-            )
-
-            val portrait = currentWidth < currentHeight
-            val lowW = if (portrait) 480 else 640
-            val lowH = if (portrait) 640 else 480
-
-            currentWidth = lowW
-            currentHeight = lowH
-            currentFPS = 15
-            // Bitrate is a strong heat/battery driver; keep it modest in idle.
-            currentBitrate = currentBitrate.coerceAtMost(900_000).coerceAtLeast(MIN_BITRATE_BPS)
-
-            // Ensure camera controls (AE FPS range) never exceed low-power ceiling.
-            cameraFpsGovernorCap = 15
-            cameraFpsCeiling = 15
-            cameraFpsRange = null
-            cameraFpsComputedForW = 0
-            cameraFpsComputedForH = 0
-
-            Log.w(
-                logFrom,
-                "🟢 [LOW POWER] Entering idle low power mode ($reason): sessions=$activeViewerSessions ui=$primaryUiVisible rec=${isRecordingActive()} -> ${currentWidth}x${currentHeight}@${currentFPS} br=$currentBitrate"
-            )
-        } else {
-            // Restore last known active config when leaving idle.
-            val restore = lastNonIdleConfig
-            if (restore != null) {
-                currentWidth = restore.width
-                currentHeight = restore.height
-                currentBitrate = restore.bitrate
-                currentFPS = restore.fps
-            } else {
-                // Fall back to profile-derived defaults if we have no previous active config.
-                ensureDeviceProfile("idle_exit")
+        if (!idleNow) {
+            idleEntryPendingRunnable?.let { rebindHandler.removeCallbacks(it) }
+            idleEntryPendingRunnable = null
+            if (lowPowerIdleMode) {
+                applyIdleExit(reason)
             }
-
-            // Restore FPS ceiling from profile when available; otherwise default to 30.
-            val prof = deviceProfile
-            val restoredCap = (prof?.chosenFixedFps ?: 30).coerceIn(15, 30)
-            cameraFpsGovernorCap = restoredCap
-            cameraFpsCeiling = restoredCap
-            cameraFpsRange = prof?.chosenAeFpsRange
-            cameraFpsComputedForW = 0
-            cameraFpsComputedForH = 0
-
-            Log.w(
-                logFrom,
-                "🟢 [LOW POWER] Exiting idle low power mode ($reason): sessions=$activeViewerSessions ui=$primaryUiVisible rec=${isRecordingActive()} -> ${currentWidth}x${currentHeight}@${currentFPS} br=$currentBitrate"
-            )
+            return
         }
 
-        // Only rebind if capture is actually running. If service is IDLE, do not start camera/encoder here.
+        if (lowPowerIdleMode) return
+        if (idleEntryPendingRunnable != null) return
+
+        idleEntryPendingRunnable = Runnable {
+            idleEntryPendingRunnable = null
+            val stillIdle = (activeViewerSessions <= 0) && !isRecordingActive() && !primaryUiVisible
+            if (stillIdle && !lowPowerIdleMode) {
+                applyIdleEnter(reason)
+            }
+        }
+        rebindHandler.postDelayed(idleEntryPendingRunnable!!, IDLE_ENTRY_DELAY_MS)
+    }
+
+    private fun applyIdleEnter(reason: String) {
+        lowPowerIdleMode = true
+        lastNonIdleConfig = StreamConfig(
+            width = currentWidth,
+            height = currentHeight,
+            bitrate = currentBitrate,
+            fps = currentFPS
+        )
+
+        val portrait = currentWidth < currentHeight
+        val lowW = if (portrait) 480 else 640
+        val lowH = if (portrait) 640 else 480
+
+        currentWidth = lowW
+        currentHeight = lowH
+        currentFPS = 15
+        val batteryLow = !batteryCharging && batteryLevelPct < BATTERY_LOW_THRESHOLD_PCT
+        val idleBitrateCap = if (batteryLow) 600_000 else 900_000
+        currentBitrate = currentBitrate.coerceAtMost(idleBitrateCap).coerceAtLeast(MIN_BITRATE_BPS)
+
+        cameraFpsGovernorCap = 15
+        cameraFpsCeiling = 15
+        cameraFpsRange = null
+        cameraFpsComputedForW = 0
+        cameraFpsComputedForH = 0
+
+        Log.w(
+            logFrom,
+            "🟢 [LOW POWER] Entering idle low power mode ($reason): sessions=$activeViewerSessions ui=$primaryUiVisible rec=${isRecordingActive()} bat=${batteryLevelPct}% charging=$batteryCharging -> ${currentWidth}x${currentHeight}@${currentFPS} br=$currentBitrate"
+        )
+
         if (serviceState != ServiceCaptureState.IDLE) {
             requestCameraRebind(
-                reason = "low_power_mode_${if (idleNow) "enter" else "exit"}_$reason",
+                reason = "low_power_mode_enter_$reason",
+                includePreview = primaryUiVisible
+            )
+        }
+    }
+
+    private fun applyIdleExit(reason: String) {
+        lowPowerIdleMode = false
+        val restore = lastNonIdleConfig
+        if (restore != null) {
+            currentWidth = restore.width
+            currentHeight = restore.height
+            currentBitrate = restore.bitrate
+            currentFPS = restore.fps
+        } else {
+            ensureDeviceProfile("idle_exit")
+        }
+
+        val prof = deviceProfile
+        val restoredCap = (prof?.chosenFixedFps ?: 30).coerceIn(15, 30)
+        cameraFpsGovernorCap = restoredCap
+        cameraFpsCeiling = restoredCap
+        cameraFpsRange = prof?.chosenAeFpsRange
+        cameraFpsComputedForW = 0
+        cameraFpsComputedForH = 0
+
+        Log.w(
+            logFrom,
+            "🟢 [LOW POWER] Exiting idle low power mode ($reason): sessions=$activeViewerSessions ui=$primaryUiVisible rec=${isRecordingActive()} -> ${currentWidth}x${currentHeight}@${currentFPS} br=$currentBitrate"
+        )
+
+        if (serviceState != ServiceCaptureState.IDLE) {
+            requestCameraRebind(
+                reason = "low_power_mode_exit_$reason",
                 includePreview = primaryUiVisible
             )
         }
@@ -786,7 +827,13 @@ class CameraForegroundService : LifecycleService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             powerManager.addThermalStatusListener(thermalListener)
         }
-
+        updateBatteryState()
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(batteryReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(batteryReceiver, filter)
+        }
 
         Log.d(logFrom, "CameraForegroundService created")
         // FGS policy (Docs/FGS_POLICY.md): start CAMERA-only; escalate to CAMERA|MICROPHONE when mic capture starts.
@@ -1011,6 +1058,10 @@ class CameraForegroundService : LifecycleService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             powerManager.removeThermalStatusListener(thermalListener)
         }
+        thermalDebounceRunnable?.let { rebindHandler.removeCallbacks(it) }
+        try {
+            unregisterReceiver(batteryReceiver)
+        } catch (_: IllegalArgumentException) { }
         orientationListener?.disable()
         super.onDestroy()
     }
@@ -3770,26 +3821,64 @@ class CameraForegroundService : LifecycleService() {
     }
 
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status: Int ->
-        // Snapshot for governor decisions + diagnostics.
         lastThermalStatus = status
-        when (status) {
-            PowerManager.THERMAL_STATUS_SEVERE, PowerManager.THERMAL_STATUS_CRITICAL, PowerManager.THERMAL_STATUS_EMERGENCY -> {
-                onThermalThrottling()
+        val needsThrottle = if (Build.VERSION.SDK_INT >= 31) {
+            status >= 2  // THERMAL_STATUS_MODERATE
+        } else {
+            status >= PowerManager.THERMAL_STATUS_SEVERE
+        }
+        if (!needsThrottle) return@OnThermalStatusChangedListener
+
+        thermalDebounceRunnable?.let { rebindHandler.removeCallbacks(it) }
+        thermalDebounceRunnable = Runnable {
+            thermalDebounceRunnable = null
+            if (lastThermalStatus == status) {
+                onThermalThrottling(status)
             }
         }
+        rebindHandler.postDelayed(thermalDebounceRunnable!!, THERMAL_DEBOUNCE_MS)
     }
 
-    private fun onThermalThrottling() {
-        Log.w("CCTV_CAMERA", "Thermal throttling detected — requesting encoder downgrade")
+    private fun onThermalThrottling(status: Int) {
+        val factor = when (status) {
+            PowerManager.THERMAL_STATUS_EMERGENCY -> 0.30f
+            PowerManager.THERMAL_STATUS_CRITICAL -> 0.50f
+            PowerManager.THERMAL_STATUS_SEVERE -> 0.70f
+            else -> if (Build.VERSION.SDK_INT >= 31 && status == 2) 0.90f else 0.70f  // 2 = THERMAL_STATUS_MODERATE
+        }
+        val newBitrate = (currentBitrate * factor).toInt().coerceAtLeast(MIN_BITRATE_BPS)
+        Log.w(logFrom, "Thermal throttling (status=$status) — bitrate ${currentBitrate / 1000}k -> ${newBitrate / 1000}k")
 
         val lowered = StreamConfig(
             width = currentWidth,
             height = currentHeight,
-            bitrate = (currentBitrate * 0.7).toInt().coerceAtLeast(300_000),
+            bitrate = newBitrate,
             fps = currentFPS
         )
 
         reconfigureEncoderIfNeeded(lowered)
+    }
+
+    private fun updateBatteryState() {
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, 100)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        batteryLevelPct = if (scale > 0) (level * 100 / scale) else 100
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        batteryCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+    }
+
+    private val batteryReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_BATTERY_CHANGED) return
+            val level = intent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, 100)
+            val scale = intent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
+            batteryLevelPct = if (scale > 0) (level * 100 / scale) else 100
+            val status = intent.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
+            batteryCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+        }
     }
 
     /*****Lifecycle Logic*****************/

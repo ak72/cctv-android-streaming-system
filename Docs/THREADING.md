@@ -56,6 +56,10 @@ Example of a hidden deadlock risk (now avoided):
 - ~~ViewerSession → requestKeyframe() → CameraForegroundService → `synchronized(encoderLock)` → encoder~~  
 - **Correct:** ViewerSession / StreamServer → `commandBus.post(RequestKeyframe)` → control thread → `handleStreamCommand` → encoder.
 
+## Viewer Threading (`StreamClientExecutors`)
+
+The Viewer uses **`StreamClientExecutors`** to manage its seven single-thread executors (connect, decode, heartbeat, sender, audio record, audio playback, reconnect). Lifecycle (create, recreate, shutdown) is centralized to reduce race complexity. See **VIEWER_ARCHITECTURE.md**.
+
 ## References
 
 - `StreamingExecutors.kt`: shared executors (control, **recording**, encoding, sender, session pool). Recording has its own single-thread executor so it is not starved by the Command Bus consumer on the control executor.

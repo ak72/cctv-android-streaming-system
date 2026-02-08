@@ -67,6 +67,9 @@ The storage location is determined by settings in `AppSettings`.
 
 ### B. File Naming & Rotation
 *   **Naming Convention**: `cctv_{timestamp}.mp4` (e.g., `cctv_1700000000000.mp4`).
+*   **Unique Filename Generation** (`generateUniqueFilename`):
+    *   Bounded to 100 attempts (counter suffix: `_1`, `_2`, …).
+    *   If exhausted, falls back to `{base}_{uuid8}` to guarantee uniqueness; logs a **warning** (Log.w) as a handled, non-critical event.
 *   **File Rotation**:
     *   **Enabled**: The system creates a new file for every recording session. If the storage limit is reached, it deletes the oldest files (*FIFO - First In, First Out*).
     *   **Disabled**: The system ensures unique filenames to preserve history but does not automatically prune old footage (User must manage space).
