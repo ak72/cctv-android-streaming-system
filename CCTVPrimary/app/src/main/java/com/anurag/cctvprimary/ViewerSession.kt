@@ -39,6 +39,8 @@ class ViewerSession(
         private const val SOCKET_TIMEOUT_MS = 20_000
         private const val HEARTBEAT_CHECK_INTERVAL_MS = 2_000L
 
+        /** Throttle: log control queue drops at most once per this interval (ms). */
+        private const val CONTROL_DROP_LOG_INTERVAL_MS = 10_000L
         /** Protocol stream state codes (authoritative; viewer must obey). 1=ACTIVE, 2=RECONFIGURING, 3=PAUSED, 4=STOPPED */
         private const val STREAM_STATE_ACTIVE = 1
         private const val STREAM_STATE_RECONFIGURING = 2
@@ -153,6 +155,7 @@ class ViewerSession(
     private val streamStateQueue = LinkedBlockingQueue<Pair<Int, Long>>(32)
     /** Atomic control batches: written in one task with one flush to prevent reorder/coalesce on some OEM kernels (e.g. STREAM_ACCEPTED + STREAM_STATE|2). Drained first in sender loop. */
     private val atomicBatchQueue = LinkedBlockingQueue<List<String>>(16)
+    @Volatile private var lastControlDropLogMs: Long = 0L
     private data class AudioItem(val pcm: ByteArray, val tsUs: Long, val rate: Int, val ch: Int, val isCompressed: Boolean) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -371,6 +374,7 @@ class ViewerSession(
 
                 line == "PRESSURE_CLEAR" -> {
                     state = StreamState.STREAMING
+                    scheduleStreamState(STREAM_STATE_ACTIVE, streamEpoch)
                     onCommand(this, RemoteCommand.PRESSURE_CLEAR, null)
                 }
                 
@@ -693,7 +697,9 @@ class ViewerSession(
     }
     fun sendControl(msg: String) {
         // Never write to the socket on the caller thread (caller can be the UI thread).
-        controlQueue.offer(ControlItem.Line(msg))
+        if (!controlQueue.offer(ControlItem.Line(msg))) {
+            logControlDrop("control_line", msg.take(60))
+        }
     }
 
     /**
@@ -702,7 +708,9 @@ class ViewerSession(
      */
     fun sendControlAtomic(vararg messages: String) {
         if (messages.isEmpty()) return
-        atomicBatchQueue.offer(messages.toList())
+        if (!atomicBatchQueue.offer(messages.toList())) {
+            logControlDrop("atomic_batch", messages.firstOrNull()?.take(60) ?: "empty")
+        }
     }
 
     /**
@@ -723,13 +731,23 @@ class ViewerSession(
 
     fun sendCsd(sps: ByteArray, pps: ByteArray) {
         // Never write to the socket on the caller thread (caller can be the UI thread).
-        controlQueue.offer(ControlItem.Csd(sps, pps))
+        if (!controlQueue.offer(ControlItem.Csd(sps, pps))) {
+            logControlDrop("CSD", "sps=${sps.size} pps=${pps.size}")
+        }
     }
 
     fun sendEncoderRotation(deg: Int) {
         // Informational only: how many degrees the Primary's encoder is rotating pixels by (0/90/180/270).
         // Viewers should NOT apply an extra rotation transform if the stream is already rotated.
         sendControl("ENC_ROT|deg=$deg")
+    }
+
+    private fun logControlDrop(kind: String, detail: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastControlDropLogMs >= CONTROL_DROP_LOG_INTERVAL_MS) {
+            lastControlDropLogMs = now
+            Log.w(TAG, "[VIEWER SESSION] Control queue full — dropped $kind (session=$sessionId) $detail")
+        }
     }
 
     private fun hmacSha256(key: String, data: String): String {

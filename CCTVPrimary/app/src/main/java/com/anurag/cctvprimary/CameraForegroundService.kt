@@ -107,6 +107,7 @@ class CameraForegroundService : LifecycleService() {
 
     /** Last time we performed an encoder recovery (stop+start). Used to throttle repeated recoveries. */
     @Volatile private var lastEncoderRecoveryUptimeMs: Long = 0L
+    @Volatile private var lastOrientationSyncFrameErrorLogMs: Long = 0L
     /** Last time a keyframe was produced (for encoder watchdog). */
     @Volatile private var lastKeyframeUptimeMs: Long = 0L
 
@@ -987,7 +988,12 @@ class CameraForegroundService : LifecycleService() {
                         synchronized(encoderLock) {
                             videoEncoder?.requestSyncFrame()
                         }
-                    } catch (_: Throwable) {
+                    } catch (t: Throwable) {
+                        val now = android.os.SystemClock.uptimeMillis()
+                        if (now - lastOrientationSyncFrameErrorLogMs >= 10_000L) {
+                            lastOrientationSyncFrameErrorLogMs = now
+                            Log.w(logFrom, "requestSyncFrame failed during orientation change (throttled)", t)
+                        }
                     }
                 }
             }

@@ -8,7 +8,7 @@
 Android fragmentation is the primary challenge in this project. 
 
 > [!NOTE]
-> **Evolution of Device Logic**: We previously used `DeviceQuirks.kt` to hardcode fixes for specific models. This has been superseded by `CameraHardwareLevelPolicy.kt`, which drives logic based on **Camera2 Hardware Level** (LEGACY/LIMITED/FULL) and **Capabilities**. `DeviceQuirks` is now primarily used for **UI display hints** only.
+> **Evolution of Device Logic**: We previously used `DeviceQuirks.kt` to hardcode fixes for specific models. This has been superseded by `CameraHardwareLevelPolicy.kt`, which drives logic based on **Camera2 Hardware Level** (LEGACY/LIMITED/FULL) and **Capabilities**. Most `DeviceQuirks` are **UI display hints** only. **Exception:** `DeviceQuirks.forceBufferInputMode()` affects pipeline mode (encoder input: buffer vs surface) for known-bad devices (e.g. Samsung M30s); when true, the prober/pipeline uses Buffer Mode to avoid encoder crashes.
 
 We maintain a history of the issues that led to these architectural decisions below.
 

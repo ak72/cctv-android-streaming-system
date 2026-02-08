@@ -102,3 +102,10 @@ The `StreamState` enum (see also [SESSION_LIFECYCLE.md](SESSION_LIFECYCLE.md)) g
 3.  **AUTHENTICATED**: Password verified, waiting for CAPS / stream negotiation.
 4.  **STREAMING**: Normal operation. Frames are flowing.
 5.  **RECONFIGURING**: Encoder is restarting (changing bitrate/resolution). Video flow is paused/dropped until new Keyframe.
+
+### 4.1. STOPPED (STREAM_STATE|4) Semantics
+When the Primary intentionally stops capture (user stops, or service stop), it sends `STREAM_STATE|4|epoch=N` (STOPPED). The Viewer:
+*   Posts **IDLE** to the UI.
+*   Sets **`autoReconnect = false`** before disconnecting.
+*   Closes the connection **without** triggering the reconnect loop.
+This distinguishes "stream intentionally ended" from "network lost" (where auto-reconnect is appropriate). See STATE_MACHINE.md and PROTOCOL_REFERENCE.md.

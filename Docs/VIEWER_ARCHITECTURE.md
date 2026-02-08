@@ -4,7 +4,7 @@
 The **CCTVViewer** app is a complex real-time video receiver. Unlike a standard video player (ExoPlayer/VLC) which buffers seconds of content, this app must play video with **minimum latency** (sub-500ms) while handling network jitter, packet loss, and device diversity. For the full list of protocol commands and message fields, see [Protocol & Message Fields](PROTOCOL_REFERENCE.md#protocol--message-fields-consolidated).
 
 ## 2. Core Components `(StreamClient.kt)`
-The `StreamClient` class orchestrates the entire session. It uses a **multi-threaded architecture** via **`StreamClientExecutors`** to prevent blocking the UI or the network.
+The `StreamClient` class orchestrates the entire session. It uses a **multi-threaded architecture** via **`StreamClientExecutors`** to prevent blocking the UI or the network. Protocol parsing (FRAME, CSD, STREAM_STATE) is implemented in **`StreamClientProtocol.kt`** with unit tests in **`StreamClientProtocolTest.kt`** (epoch gating, STOPPED behavior, malformed input handling).
 
 ### A. The Threading Model (`StreamClientExecutors`)
 

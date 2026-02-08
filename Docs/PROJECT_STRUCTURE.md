@@ -25,9 +25,11 @@ Both apps follow the standard Android architecture:
 ### Key Files (Viewer)
 *   `StreamClient.kt`: TCP Client & Jitter Buffer.
 *   `MainActivity.kt`: UI & Rendering logic (SurfaceView/TextureView).
+*   **Tests** (CCTVViewer `app/src/test`):
+    *   `StreamClientProtocolTest.kt`: Unit tests for FRAME/CSD/STREAM_STATE parsing, epoch gating, STOPPED behavior. See PROTOCOL_REFERENCE.md and STATE_MACHINE.md.
 *   **Protocol & Helpers**:
     *   `ConnectionState.kt`, `StreamConfig.kt`: Shared data types.
-    *   `StreamClientProtocol.kt`: Packet definition helpers.
+    *   `StreamClientProtocol.kt`: Protocol parsing (`parseParams`, `parseStreamState`, `parseFrameHeader`, `parseCsdHeader`), epoch gating, and STREAM_STATE code mapping. Used by `StreamClient` and covered by `StreamClientProtocolTest.kt`.
     *   `DeviceQuirks.kt`: Renderer workarounds.
 
 ## 3. Libraries & Tech Stack

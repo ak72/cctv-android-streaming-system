@@ -3,10 +3,12 @@
 ## 0. First Launch / Probing (One-Time)
 Before the first connection is possible:
 1.  **Permission Grant**: User accepts Camera/Audio permissions.
-2.  **Auto-Probe**: `ActivePipelineProber` silently tests different encoder configurations.
-    *   *Step A*: Try 1080p @ 30fps (Surface Mode). If crash/timeout ->
-    *   *Step B*: Try 720p @ 30fps (Surface Mode). If crash/timeout ->
-    *   *Step C*: Try 720p @ 30fps (**Buffer Mode**).
+2.  **Auto-Probe**: `ActivePipelineProber` silently tests the encoder pipeline.
+    *   **Candidate ladder**: Built by `DeviceProfileManager.qualityLadder()` — descending quality (e.g. 1080p→720p→720p@24fps→480p), device-specific from Camera2 capabilities.
+    *   **Policy**: If `DeviceQuirks.forceBufferInputMode()` or `AppSettings.isForceBufferMode()` is true, skip Surface and probe Buffer Mode only.
+    *   **Surface phase**: For each candidate (up to `maxAttempts`), try Surface Mode. Optionally **combo probe** (Preview + ImageAnalysis + VideoCapture) to verify recording+streaming simultaneously; if combo fails, device may need Buffer Mode or lower resolution.
+    *   **Buffer phase**: If Surface phase yields no working config, try Buffer Mode for each candidate.
+    *   Success = at least 1 encoded frame within timeout.
 3.  **Profile Saved**: The working configuration is persisted via `DeviceProfileStore` (SharedPreferences JSON, keyed by firmware fingerprint + camera).
 4.  **Ready**: The "Start Capture" button becomes enabled.
 

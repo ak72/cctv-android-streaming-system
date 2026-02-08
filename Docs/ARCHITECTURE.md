@@ -52,7 +52,7 @@ Before streaming starts, the service ensures the device profile exists and, on f
 | **`ActivePipelineProber`** | Optional active probe (first launch) | Runs short test binds (Surface then Buffer mode, descending resolutions). Success = at least one encoded frame within timeout. Result (e.g. “use Buffer, max 720p”) is written into the profile. Used when the service needs an empirically validated starting config. |
 | **`EncoderProbeStore`** | Persist Surface input failure | If Surface input fails at runtime (or in probe), marks “Surface input bad” so future launches prefer Buffer mode without re-probing. |
 | **`EncoderCapabilityDetector`** | Codec capability check | Queries `MediaCodecList` for AVC Surface input support. |
-| **`DeviceQuirks`** | UI / display hints only | Legacy device hints; **not** used for pipeline decisions. Pipeline policy is in `CameraHardwareLevelPolicy` and the profile. |
+| **`DeviceQuirks`** | Mostly UI hints; one pipeline exception | Most quirks are display hints only. **Exception:** `forceBufferInputMode()` affects pipeline mode (buffer vs surface) for known-bad devices (e.g. Samsung M30s). Pipeline policy is otherwise in `CameraHardwareLevelPolicy` and the profile. |
 | **`SizeSelector`** | Resolution selection | Intersects preview/YUV/recorder sizes; picks 4:3 portrait candidates; used when building the profile ladder. |
 
 ### 2.2. Threading & Executors
@@ -160,7 +160,7 @@ The Viewer focuses on **low-latency** decoding and **robust state management** w
 
 ### C. Capability- and Hardware-Level–Driven Policy
 
-- Pipeline choices (buffer vs surface, FPS cap, dynamic bitrate) come from **Camera2 hardware level** and **codec capabilities**, not from device name. `CameraHardwareLevelPolicy` and `DeviceProfile` are the source of truth; `DeviceQuirks` is UI-only.
+- Pipeline choices (buffer vs surface, FPS cap, dynamic bitrate) come from **Camera2 hardware level** and **codec capabilities**, not from device name. `CameraHardwareLevelPolicy` and `DeviceProfile` are the source of truth. `DeviceQuirks` is mostly UI-only; `forceBufferInputMode()` is the exception for known-bad devices.
 
 ### D. Backpressure & Drop Policy
 

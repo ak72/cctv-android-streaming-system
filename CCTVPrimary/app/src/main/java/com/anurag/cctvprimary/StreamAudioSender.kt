@@ -6,6 +6,7 @@ import android.media.MediaFormat
 import android.util.Log
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.tanh
 
 /**
@@ -46,6 +47,8 @@ class StreamAudioSender(
 
     // Diagnostic: throttled stats for audio pipeline debugging
     private var lastStreamDiagMs: Long = 0L
+    private val aacQueueDropCount = AtomicLong(0L)
+    private var lastAacDropLogMs: Long = 0L
 
     
     init {
@@ -70,7 +73,14 @@ class StreamAudioSender(
             // Apply volume boost with soft limiting
             val processedPcm = applyGainWithSoftLimit(pcm)
             
-            aacInputQueue.offer(processedPcm)
+            if (!aacInputQueue.offer(processedPcm)) {
+                val drops = aacQueueDropCount.incrementAndGet()
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - lastAacDropLogMs >= 10_000L) {
+                    lastAacDropLogMs = now
+                    Log.w(logFrom, "AAC input queue full — dropped PCM (total drops=$drops, queueSize=${aacInputQueue.size})")
+                }
+            }
         } catch (e: Exception) {
             Log.e(logFrom, "Error processing audio", e)
         }
@@ -354,9 +364,6 @@ class StreamAudioSender(
             Log.w(logFrom, "Error releasing AAC encoder", e)
         }
         aacEncoder = null
-        
-        synchronized(aacInputLock) {
-            aacInputQueue.clear()
-        }
+        aacInputQueue.clear()
     }
 }

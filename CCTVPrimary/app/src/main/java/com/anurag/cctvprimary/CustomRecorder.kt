@@ -115,6 +115,7 @@ class CustomRecorder(
     // Diagnostics: track encodeFrame conversion/queue time + observed input FPS
     private var lastEncodeDiagMs: Long = 0L
     private var lastEncodeCamTsUs: Long = -1L
+    private var lastEncodeErrorLogMs: Long = 0L
 
     // Video orientation handling
     // If non-zero (90/180/270), we encode frames in sensor orientation (no pixel rotation)
@@ -601,7 +602,11 @@ class CustomRecorder(
             codec.queueInputBuffer(inputIndex, 0, frameSize, ptsUs, 0)
             encodedFrameCount++
         } catch (e: Exception) {
-            Log.e(logFrom, "Error encoding frame", e)
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastEncodeErrorLogMs >= 10_000L) {
+                lastEncodeErrorLogMs = now
+                Log.w(logFrom, "Recorder encode error (throttled): ${e.message}", e)
+            }
         } finally {
             closeIfNeeded()
         }

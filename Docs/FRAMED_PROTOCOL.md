@@ -37,4 +37,6 @@ Control messages (STREAM_STATE, CSD, SESSION, PROTO, etc.) remain **newline-term
 ## Backward compatibility
 
 - Viewer sends `HELLO|version=2` (or no version): Primary uses legacy text `FRAME|...|size=N` + payload.
-- Viewer sends `HELLO|version=3`: Primary uses binary framed format for video; control stays line-based.
+- Primary supports `HELLO|version=3`: if a v3 client connects, Primary uses binary framed format for video; control stays line-based.
+
+**Note:** The current Viewer implementation uses v2 only. It sends `HELLO|client=viewer|version=2` and parses text `FRAME|...|size=N` + payload. Binary framed (v3) is server-side ready; Viewer v3 parsing is not yet implemented.

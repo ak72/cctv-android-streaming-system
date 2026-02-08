@@ -32,6 +32,7 @@ class StreamServer(
     
     private val requestedConfigs = mutableMapOf<ViewerSession, StreamConfig>()
     private val resumeStates = mutableMapOf<String, ResumeState>()
+    private const val RESUME_STATE_TTL_MS = 5 * 60 * 1000L // 5 minutes
     @Volatile private var lastCsd: Pair<ByteArray, ByteArray>? = null
     @Volatile var isRecordingProvider: (() -> Boolean)? = null
     @Volatile var cameraFacingProvider: (() -> Boolean)? = null
@@ -348,6 +349,7 @@ class StreamServer(
                 onSessionClosed = { closed ->
                 synchronized(configLock) {
                     requestedConfigs.remove(closed)
+                    resumeStates.remove(closed.sessionId)
                     val removed = sessions.remove(closed)
                     val activeAfter = sessions.size
                     resolveEncoderConfigLocked()
@@ -369,8 +371,15 @@ class StreamServer(
         )
 
     }
+    private fun evictStaleResumeStates() {
+        val now = System.currentTimeMillis()
+        val toRemove = resumeStates.filter { (_, rs) -> now - rs.timestampMs > RESUME_STATE_TTL_MS }.keys
+        toRemove.forEach { resumeStates.remove(it) }
+    }
+
     fun handleResumeRequest(session: ViewerSession, requestedSessionId: String) {
         synchronized(configLock) {
+            evictStaleResumeStates()
             val cfg = resumeStates[requestedSessionId]?.config
             if (cfg != null) {
                 session.sessionId = requestedSessionId
@@ -391,7 +400,7 @@ class StreamServer(
         if (requestedConfigs.isEmpty()) return
 
         val winner = requestedConfigs.values.minBy {
-            it.width * it.height * it.bitrate
+            it.width.toLong() * it.height * it.bitrate
         }
 
         // IMPORTANT — Epoch thrash mitigation:
@@ -434,6 +443,7 @@ class StreamServer(
                 )
             }
 
+            evictStaleResumeStates()
             val now = System.currentTimeMillis()
             sessions.forEach { session ->
                 resumeStates[session.sessionId] = ResumeState(activeConfig!!, now)
@@ -545,6 +555,7 @@ class StreamServer(
                 Log.d(logFrom, "[STREAM SERVER] 🔵 [RESOLUTION] Updated activeConfig from ${oldConfig.width}x${oldConfig.height} to actual encoder ${encoderWidth}x${encoderHeight}")
                 
                 // Broadcast updated STREAM_ACCEPTED + RECONFIGURING atomically so viewer never sees reorder on some OEM kernels
+                evictStaleResumeStates()
                 val now = System.currentTimeMillis()
                 sessions.forEach { session ->
                     resumeStates[session.sessionId] = ResumeState(activeConfig!!, now)

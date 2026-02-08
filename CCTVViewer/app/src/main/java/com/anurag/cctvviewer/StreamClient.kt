@@ -527,6 +527,7 @@ class StreamClient(
     fun connect() {
         // User requested connection; allow reconnect logic again.
         autoReconnect = true
+        serverHonorsResolutionRequests = true
 
         // IMPORTANT: Reset decode/render state for a fresh connection attempt.
         // This prevents a stale "green surface" / non-starting decoder scenario if previous state leaked.
@@ -774,6 +775,7 @@ class StreamClient(
     }
 
     private fun listen() {
+        var lastParsedLine: String? = null
         try {
             Log.d(logFrom, "🔵 [SOCKET] Starting listen loop - waiting for messages from server")
             while (true) {
@@ -785,6 +787,7 @@ class StreamClient(
                 }
                 
                 val line = readLineFromSocket() ?: break
+                lastParsedLine = line
                 // Check if this looks like binary data (contains non-printable characters)
                 val isBinary = line.any { it.code < 32 && it != '\r' && it != '\n' && it != '\t' }
                 if (isBinary && !line.startsWith("FRAME|") && !line.startsWith("CSD|") && !line.startsWith("AUDIO_FRAME|")) {
@@ -935,8 +938,9 @@ class StreamClient(
                                 postState(ConnectionState.CONNECTED)
                             }
                             4 -> {
-                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — posting IDLE then disconnecting")
+                                Log.d(logFrom, "[Stream Client] STREAM_STATE STOPPED — posting IDLE then disconnecting (no auto-reconnect)")
                                 postState(ConnectionState.IDLE)
+                                autoReconnect = false
                                 disconnectForRecovery("server_stopped")
                             }
                             else -> Log.w(logFrom, "[Stream Client] STREAM_STATE unknown code=$code")
@@ -1662,6 +1666,14 @@ class StreamClient(
             Log.w(logFrom, "🔴 [SOCKET] Unexpected exception in listen loop: ${e.javaClass.simpleName}", e)
             if (autoReconnect) postError(mapExceptionToUserMessage(e, "stream"))
         } finally {
+            val s = socket
+            val socketState = when {
+                s == null -> "null"
+                s.isClosed -> "closed"
+                !s.isConnected -> "disconnected"
+                else -> "connected"
+            }
+            Log.d(logFrom, "🔵 [SOCKET] Listen loop exit: lastParsedLine=${lastParsedLine?.take(80) ?: "(none)"}, socket=$socketState")
             stopHeartbeat()
             closeSocket()
             logDisconnectSummary("socket_close")
@@ -3966,11 +3978,17 @@ class StreamClient(
             val state = currentState
             if (state != ConnectionState.STREAMING && state != ConnectionState.RECOVERING) return
 
-            // Authority liveness: if server sends STREAM_STATE, we must see it periodically or downgrade (server/encoder/camera may be stuck).
+            // Authority liveness: only downgrade when there is evidence of staleness (no frames, no PONG).
+            // Primary sends STREAM_STATE on transitions, not periodically; if frames are flowing, skip freshness check.
             if (serverSupportsStreamState && lastStreamStateFromServerUptimeMs > 0L) {
                 val sinceLastState = nowUptimeMs - lastStreamStateFromServerUptimeMs
-                if (sinceLastState >= STREAM_STATE_FRESHNESS_TIMEOUT_MS) {
-                    Log.w(logFrom, "[Stream Client] ⚠️ [AUTHORITY] No STREAM_STATE for ${sinceLastState}ms — downgrading to RECOVERING (liveness validation)")
+                val lastActivityUptime = maxOf(lastFrameRxUptimeMs, lastFrameRenderUptimeMs)
+                val sinceLastActivity = if (lastActivityUptime > 0L) (nowUptimeMs - lastActivityUptime) else Long.MAX_VALUE
+                val sincePong = if (lastPongUptimeMs > 0L) (nowUptimeMs - lastPongUptimeMs) else Long.MAX_VALUE
+                val framesFlowing = sinceLastActivity < 5_000L
+                val pongRecent = sincePong < 7_000L
+                if (sinceLastState >= STREAM_STATE_FRESHNESS_TIMEOUT_MS && !framesFlowing && !pongRecent) {
+                    Log.w(logFrom, "[Stream Client] ⚠️ [AUTHORITY] No STREAM_STATE for ${sinceLastState}ms and no recent activity — downgrading to RECOVERING (liveness validation)")
                     postState(ConnectionState.RECOVERING)
                     requestKeyframe("authority_freshness")
                     return
